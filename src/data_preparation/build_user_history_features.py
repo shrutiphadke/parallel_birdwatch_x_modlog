@@ -725,14 +725,22 @@ def audit_timestamp_semantics(
     return report
 
 
-def _read_parquet_parts(path: Path, columns: Optional[list[str]] = None) -> pd.DataFrame:
-    if not path.exists():
-        raise FileNotFoundError(path)
+def _read_parquet_parts(
+    path: Path, columns: Optional[list[str]] = None, allow_empty: bool = False
+) -> pd.DataFrame:
+    schema_path = (
+        next(path.glob("*.parquet"), None) if path.is_dir() else (path if path.exists() else None)
+    )
+    if schema_path is None:
+        if allow_empty:
+            # e.g. a reply graph with zero edges when contribution histories hold no
+            # comments (posts only) — a valid, empty result, not a failed build stage.
+            return pd.DataFrame(columns=columns or [])
+        if not path.exists():
+            raise FileNotFoundError(path)
+        raise ValueError(f"No Parquet parts found under {path}")
     if columns is None:
         return pd.read_parquet(path)
-    schema_path = next(path.glob("*.parquet"), None) if path.is_dir() else path
-    if schema_path is None:
-        raise ValueError(f"No Parquet parts found under {path}")
     available = set(pq.ParquetFile(schema_path).schema_arrow.names)
     aliases = {"timestamp": "created_utc", "item_id": "thing_id"}
     projected = [
@@ -945,6 +953,7 @@ def build_features(
         reply_graph = _read_parquet_parts(
             feature_root / "reply_graph",
             columns=["from_user", "to_user", "subreddit", "timestamp"],
+            allow_empty=True,
         )
         interaction_events = _build_interaction_events(reply_graph)
         if interaction_events.empty:
