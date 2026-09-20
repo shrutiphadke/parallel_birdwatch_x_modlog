@@ -262,6 +262,8 @@ def _direct_config(
     device: str,
     excluded_methods: Sequence[str] = (),
     cache_dir: Path | None = None,
+    normvio_models: Path | None = None,
+    normvio_bert: str | None = None,
 ) -> ReproductionConfig:
     """Build the conventional layout used by the simple ``--input`` interface."""
     if not dataset or any(
@@ -319,8 +321,10 @@ def _direct_config(
         user_contributions=supplied(user_contributions, default_user_contributions),
         user_metadata=supplied(user_metadata, processed / "user_metadata.csv"),
         external_scores=supplied(external_scores, auxiliary / "moderated_posts_scores.parquet"),
-        normvio_models=PROJECT_ROOT / "external" / "normvio" / "normvio_redditmodels",
-        normvio_bert=DEFAULT_NORMVIO_BERT,
+        normvio_models=supplied(
+            normvio_models, PROJECT_ROOT / "external" / "normvio" / "normvio_redditmodels"
+        ),
+        normvio_bert=normvio_bert or DEFAULT_NORMVIO_BERT,
         embedding_model=DEFAULT_EMBEDDING_MODEL,
         interim=interim,
         splits=PROJECT_ROOT / "data" / "splits" / dataset,
@@ -720,6 +724,23 @@ def reproduce(
             ),
         ),
     ] = None,
+    normvio_models: Annotated[
+        Path | None,
+        typer.Option(
+            "--normvio-models",
+            help=(
+                "Directory with one sub-folder per NormVio category (each holding "
+                "finetuned_model.pt). Defaults to external/normvio/normvio_redditmodels."
+            ),
+        ),
+    ] = None,
+    normvio_bert: Annotated[
+        str | None,
+        typer.Option(
+            "--normvio-bert",
+            help="NormVio BERT encoder: a Hugging Face model id or local snapshot directory.",
+        ),
+    ] = None,
     config_path: Annotated[
         Path | None,
         typer.Option("--config", "-c", help="Optional advanced config for non-standard paths."),
@@ -732,9 +753,12 @@ def reproduce(
     """Prepare, evaluate, and render one dataset in a single launch."""
     if config_path is not None and input_path is not None:
         raise typer.BadParameter("use either --input or --config, not both")
-    if config_path is not None and cache_dir is not None:
+    if config_path is not None and (
+        cache_dir is not None or normvio_models is not None or normvio_bert is not None
+    ):
         raise typer.BadParameter(
-            "--cache-dir only applies to --input; set outputs.cache/outputs.interim in --config"
+            "--cache-dir/--normvio-models/--normvio-bert only apply to --input; "
+            "set them under inputs/outputs in --config"
         )
     if config_path is not None:
         config = _load_config(config_path)
@@ -771,6 +795,8 @@ def reproduce(
             graphs=graphs,
             device=device,
             cache_dir=cache_dir,
+            normvio_models=normvio_models,
+            normvio_bert=normvio_bert,
         )
     else:
         raise typer.BadParameter("provide the votes table with --input", param_hint="--input")
