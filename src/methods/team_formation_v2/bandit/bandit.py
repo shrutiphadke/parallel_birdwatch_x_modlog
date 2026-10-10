@@ -36,7 +36,8 @@ class LinearUCB:
                 f"Expected {self.dimension} features, received {matrix.shape[1]}"
             )
         means = matrix @ self.theta
-        variances = np.einsum("ij,jk,ik->i", matrix, self.a_inv, matrix)
+        # Row-wise x^T A^-1 x; an unoptimized 3-operand einsum is far slower.
+        variances = np.sum((matrix @ self.a_inv) * matrix, axis=1)
         uncertainty = np.sqrt(np.maximum(variances, 0.0))
         bonus = self.alpha * uncertainty if explore else 0.0
         return means + bonus, means, uncertainty

@@ -26,6 +26,7 @@ from src.methods.team_formation_v2.shared_features import (  # noqa: E402
     calibrate_thresholds_per_community,
     classification_metrics,
     load_and_enrich_splits,
+    with_columns,
 )
 
 DEFAULT_VOTES_DIR = "data/splits/reddit/intersection_chronological"
@@ -167,6 +168,8 @@ class TeamFormationEnvironment:
         self.community_state: defaultdict[str, dict[str, int]] = defaultdict(
             lambda: {"n": 0, "positive": 0}
         )
+        # Pools are frozen, so their per-community arrays are built once.
+        self._pool_cache: dict[str, tuple[pd.DataFrame, dict[str, np.ndarray], list[str]]] = {}
 
     @property
     def feature_dimension(self) -> int:
@@ -189,6 +192,25 @@ class TeamFormationEnvironment:
             }
 
     def _pool(self, community: str) -> pd.DataFrame:
+        return self._prepared_pool(community)[0]
+
+    def _prepared_pool(
+        self, community: str
+    ) -> tuple[pd.DataFrame, dict[str, np.ndarray], list[str]]:
+        key = str(community)
+        cached = self._pool_cache.get(key)
+        if cached is None:
+            pool = self._raw_pool(key)
+            arrays = {
+                "user": pool[self.profile_columns].to_numpy(dtype=float),
+                "local_activity": pool["profile_local_activity"].to_numpy(dtype=float),
+                "domain_share": pool["profile_domain_share"].to_numpy(dtype=float),
+            }
+            cached = (pool, arrays, pool["username"].astype(str).tolist())
+            self._pool_cache[key] = cached
+        return cached
+
+    def _raw_pool(self, community: str) -> pd.DataFrame:
         pool = self.candidate_pools.get(str(community))
         if pool is None or pool.empty:
             # A community with no historical candidates cannot support genuine
@@ -209,9 +231,16 @@ class TeamFormationEnvironment:
         prior = (state["positive"] + 1.0) / (state["n"] + 2.0)
         history = min(np.log1p(state["n"]) / 8.0, 1.0)
         shared = np.concatenate(([1.0], content, [prior, history]))
-        user = pool[self.profile_columns].to_numpy(dtype=float)
-        local_activity = pool["profile_local_activity"].to_numpy(dtype=float)
-        domain_share = pool["profile_domain_share"].to_numpy(dtype=float)
+        prepared = self._pool_cache.get(str(community))
+        if prepared is not None and prepared[0] is pool:
+            arrays = prepared[1]
+            user = arrays["user"]
+            local_activity = arrays["local_activity"]
+            domain_share = arrays["domain_share"]
+        else:
+            user = pool[self.profile_columns].to_numpy(dtype=float)
+            local_activity = pool["profile_local_activity"].to_numpy(dtype=float)
+            domain_share = pool["profile_domain_share"].to_numpy(dtype=float)
         activity_interaction = local_activity[:, None] * content[None, :]
         domain_interaction = domain_share[:, None] * content[None, :]
         return np.column_stack(
@@ -233,7 +262,7 @@ class TeamFormationEnvironment:
         explore: bool,
         update: bool,
     ) -> tuple[dict, pd.DataFrame]:
-        pool = self._pool(community)
+        pool, _, users = self._prepared_pool(community)
         if pool.empty:
             return {
                 "item_id": item_id,
@@ -244,7 +273,6 @@ class TeamFormationEnvironment:
                 "candidate_pool_size": 0,
                 "eligible": False,
             }, pd.DataFrame()
-        users = pool["username"].astype(str).tolist()
         # Selection happens before any vote is generated. The simulator is
         # queried only for the chosen arms below, so unselected rewards remain
         # genuinely hidden from the policy.
@@ -280,19 +308,23 @@ class TeamFormationEnvironment:
             "candidate_pool_size": int(len(pool)),
             "eligible": True,
         }
-        members = pool.iloc[selected][["username", "community", *self.profile_columns]].copy()
-        members.insert(0, "item_id", item_id)
-        members["label"] = int(label)
-        members["simulated_vote_score"] = selected_simulated_scores
-        members["simulated_vote"] = selected_votes
-        members["linucb_selection_score"] = selection_score[selected]
-        members["linucb_mean_reward"] = mean[selected]
-        members["linucb_uncertainty"] = uncertainty[selected]
-        members["trust_weight"] = trust_weights
-        members["selected_rank"] = np.arange(1, k + 1)
-        members["exploration_enabled"] = bool(explore)
-        members["panel_score"] = panel_score
-        members["panel_reward"] = panel_reward
+        members = with_columns(
+            pool.iloc[selected][["username", "community", *self.profile_columns]],
+            {"item_id": item_id},
+            {
+                "label": int(label),
+                "simulated_vote_score": selected_simulated_scores,
+                "simulated_vote": selected_votes,
+                "linucb_selection_score": selection_score[selected],
+                "linucb_mean_reward": mean[selected],
+                "linucb_uncertainty": uncertainty[selected],
+                "trust_weight": trust_weights,
+                "selected_rank": np.arange(1, k + 1),
+                "exploration_enabled": bool(explore),
+                "panel_score": panel_score,
+                "panel_reward": panel_reward,
+            },
+        )
         if update:
             # Normalized weights give each panel one unit of update mass.
             rewards = np.full(k, panel_reward, dtype=float)

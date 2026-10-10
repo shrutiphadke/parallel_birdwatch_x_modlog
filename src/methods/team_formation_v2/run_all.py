@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -156,6 +158,41 @@ def build_command(
     return command
 
 
+_BLAS_THREAD_VARIABLES = (
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+)
+
+
+def child_environment(jobs: int) -> dict[str, str] | None:
+    """Share cores between parallel runs instead of oversubscribing BLAS."""
+    if jobs <= 1:
+        return None
+    threads = str(max(1, (os.cpu_count() or 1) // jobs))
+    environment = dict(os.environ)
+    for variable in _BLAS_THREAD_VARIABLES:
+        environment.setdefault(variable, threads)
+    return environment
+
+
+def run_command(command: list[str], log_path: Path | None, environment) -> int:
+    """Run one method; parallel runs log to a file instead of the console."""
+    if log_path is None:
+        return subprocess.run(command, cwd=_PROJECT_ROOT, check=False).returncode
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("w", encoding="utf-8") as log:
+        return subprocess.run(
+            command,
+            cwd=_PROJECT_ROOT,
+            check=False,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            env=environment,
+        ).returncode
+
+
 def main() -> None:
     """Run every active method on all discovered prepared splits."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -183,12 +220,24 @@ def main() -> None:
         help="Print the split-by-method execution matrix without starting subprocesses.",
     )
     parser.add_argument(
+        "--jobs",
+        type=int,
+        default=int(os.environ.get("TEAM_FORMATION_JOBS", "1")),
+        help=(
+            "Split/method runs to execute in parallel (default 1, or "
+            "$TEAM_FORMATION_JOBS). With more than one, each run writes run_all.log "
+            "in its output directory."
+        ),
+    )
+    parser.add_argument(
         "--skip-existing",
         action="store_true",
         help="Skip a method when its active metrics.json already exists for that split.",
     )
     args = parser.parse_args()
 
+    if args.jobs < 1:
+        parser.error("--jobs must be at least 1")
     excluded = set(args.exclude_method)
     selected_methods = [method for method in args.methods if method not in excluded]
     if not selected_methods:
@@ -201,10 +250,13 @@ def main() -> None:
     summary_filename = "team_formation_plan.json" if args.dry_run else "team_formation.json"
     summary_path = out_root / "summaries" / summary_filename
     summary: dict[str, str] = {}
+    pending: list[tuple[str, list[str], Path, str, Path]] = []
+    plan: list[str] = []
     for split_name, split_path in splits.items():
         for method in selected_methods:
             out_dir = out_root.joinpath(*split_name.split("/"), method)
             run_name = f"{split_name}/{method}"
+            plan.append(run_name)
             command = build_command(
                 method,
                 split_path,
@@ -212,24 +264,51 @@ def main() -> None:
                 args.causal_features,
                 args.embedding_dir,
             )
-            print(f"Running {run_name}")
             if args.skip_existing and has_active_metrics(out_dir / "metrics.json", method):
                 summary[run_name] = "SKIPPED (active metrics.json exists)"
+                print(f"Running {run_name}")
                 print(summary[run_name])
                 write_summary(summary_path, summary)
                 continue
             if args.dry_run:
+                print(f"Running {run_name}")
                 print(subprocess.list2cmdline(command))
                 summary[run_name] = "DRY RUN"
                 write_summary(summary_path, summary)
                 continue
-            result = subprocess.run(command, cwd=_PROJECT_ROOT, check=False)
-            summary[run_name] = (
-                "OK" if result.returncode == 0 else f"FAILED (exit {result.returncode})"
-            )
-            if result.returncode == 0:
-                annotate_outer_protocol(out_dir / "metrics.json", split_name, split_path)
-            write_summary(summary_path, summary)
+            pending.append((run_name, command, out_dir, split_name, split_path))
+
+    def finish(run: tuple, returncode: int) -> None:
+        run_name, _, out_dir, split_name, split_path = run
+        summary[run_name] = "OK" if returncode == 0 else f"FAILED (exit {returncode})"
+        if returncode == 0:
+            annotate_outer_protocol(out_dir / "metrics.json", split_name, split_path)
+        elif args.jobs > 1:
+            print(f"{run_name}: {summary[run_name]} | log={out_dir / 'run_all.log'}")
+        write_summary(summary_path, summary)
+
+    if args.jobs == 1:
+        for run in pending:
+            print(f"Running {run[0]}")
+            finish(run, run_command(run[1], None, None))
+    else:
+        environment = child_environment(args.jobs)
+        print(f"Running {len(pending)} method runs with {args.jobs} parallel jobs")
+        with ThreadPoolExecutor(max_workers=args.jobs) as executor:
+            futures = {
+                executor.submit(
+                    run_command, run[1], run[2] / "run_all.log", environment
+                ): run
+                for run in pending
+            }
+            for future in as_completed(futures):
+                run = futures[future]
+                finish(run, future.result())
+                print(f"Finished {run[0]}: {summary[run[0]]}")
+        # Report in plan order, not completion order.
+        reordered = {name: summary[name] for name in plan if name in summary}
+        summary.clear()
+        summary.update(reordered)
 
     print("Summary")
     for run_name, status in summary.items():

@@ -36,8 +36,10 @@ from src.methods.team_formation_v2.shared_features import (  # noqa: E402
     DEFAULT_CAUSAL_FEATURES,
     apply_thresholds,
     calibrate_thresholds_per_community,
+    centroid_affinities,
     classification_metrics,
     load_and_enrich_splits,
+    with_columns,
 )
 
 DEFAULT_VOTES_DIR = "data/splits/reddit/intersection_chronological"
@@ -62,6 +64,21 @@ def fit_user_topic_centroids(
     return centroids
 
 
+def case_topic_affinity(
+    usernames: list[str],
+    item_id: object,
+    encoder: PostContextEncoder,
+    centroids: dict[str, np.ndarray],
+) -> np.ndarray:
+    """Clipped prefix-only user/content cosine affinity for one case."""
+    content, _ = encoder.content_vector(item_id)
+    if float(np.linalg.norm(content)) > 0:
+        affinities = centroid_affinities(usernames, centroids, content)
+    else:
+        affinities = np.full(len(usernames), 0.5, dtype=float)
+    return np.clip(affinities, 0.0, 1.0)
+
+
 def attach_case_expertise(
     candidates: pd.DataFrame,
     item_id: object,
@@ -69,21 +86,13 @@ def attach_case_expertise(
     centroids: dict[str, np.ndarray],
 ) -> pd.DataFrame:
     """Use prefix-only user/content affinity as topical expertise for the case."""
-    out = candidates.copy()
-    content, _ = encoder.content_vector(item_id)
-    norm = float(np.linalg.norm(content))
-    if norm > 0:
-        normalized = content / norm
-        affinities = [
-            (float(centroids.get(str(user), np.zeros_like(normalized)) @ normalized) + 1.0)
-            / 2.0
-            for user in out["username"]
-        ]
-    else:
-        affinities = [0.5] * len(out)
-    out["case_topic_affinity"] = np.clip(affinities, 0.0, 1.0)
-    out["topical_expertise"] = out["case_topic_affinity"]
-    return out
+    affinity = case_topic_affinity(
+        candidates["username"].astype(str).tolist(), item_id, encoder, centroids
+    )
+    return with_columns(
+        candidates,
+        trailing={"case_topic_affinity": affinity, "topical_expertise": affinity},
+    )
 
 
 def score_cases(
@@ -117,20 +126,24 @@ def score_cases(
             )
             continue
         candidates = optimizer.candidates
-        candidates = attach_case_expertise(
-            candidates.reset_index(drop=True),
-            row.item_id,
-            simulator.encoder,
-            centroids,
+        expertise = case_topic_affinity(
+            optimizer.usernames, row.item_id, simulator.encoder, centroids
         )
         seed = int.from_bytes(
             hashlib.blake2b(str(row.item_id).encode(), digest_size=4).digest(), "little"
         )
         selected, objectives, front_size, ideal_distance = optimizer.compose(
-            candidates["topical_expertise"].to_numpy(dtype=float),
+            expertise,
             seed,
         )
-        team = candidates.iloc[list(selected)].copy()
+        # Equivalent to attach_case_expertise on the pool, restricted to the team.
+        team = with_columns(
+            candidates.iloc[list(selected)],
+            trailing={
+                "case_topic_affinity": expertise[list(selected)],
+                "topical_expertise": expertise[list(selected)],
+            },
+        )
         simulated_scores = simulator.predict_scores(
             row.item_id, str(row.community), team["username"].astype(str).tolist()
         )
@@ -154,13 +167,18 @@ def score_cases(
                 "pareto_ideal_distance": float(ideal_distance),
             }
         )
-        team.insert(0, "item_id", row.item_id)
-        team["label"] = int(row.label)
-        team["simulated_vote_score"] = simulated_scores
-        team["simulated_vote"] = simulated_votes
-        team["selected_rank"] = np.arange(1, len(team) + 1)
-        team["pareto_front_size"] = int(front_size)
-        team["pareto_ideal_distance"] = float(ideal_distance)
+        team = with_columns(
+            team,
+            {"item_id": row.item_id},
+            {
+                "label": int(row.label),
+                "simulated_vote_score": simulated_scores,
+                "simulated_vote": simulated_votes,
+                "selected_rank": np.arange(1, len(team) + 1),
+                "pareto_front_size": int(front_size),
+                "pareto_ideal_distance": float(ideal_distance),
+            },
+        )
         member_rows.append(team)
     members = pd.concat(member_rows, ignore_index=True) if member_rows else pd.DataFrame()
     return pd.DataFrame(item_rows), members

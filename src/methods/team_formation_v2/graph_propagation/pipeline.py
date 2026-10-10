@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import argparse
-from collections import defaultdict
-from itertools import combinations
 import json
 from pathlib import Path
 import sys
@@ -33,8 +31,11 @@ from src.methods.team_formation_v2.shared_features import (  # noqa: E402
     DEFAULT_CAUSAL_FEATURES,
     apply_thresholds,
     calibrate_thresholds_per_community,
+    centroid_affinities,
     classification_metrics,
     load_and_enrich_splits,
+    stable_top_indices,
+    with_columns,
 )
 
 DEFAULT_VOTES_DIR = "data/splits/reddit/intersection_chronological"
@@ -96,59 +97,54 @@ class TopicConditionedPPR:
         work = reference.assign(
             _agree=(reference["vote"] == reference["label"]).astype(float)
         )
+        work["username"] = work["username"].astype(str)
         agreement = work.groupby("username")["_agree"].agg(["sum", "count"])
+        agreement = agreement.reindex(self.users)
         base = float(work["_agree"].mean()) if len(work) else 0.5
-        self.alignment = np.asarray(
-            [
-                (float(agreement.loc[user, "sum"]) + 5.0 * base)
-                / (float(agreement.loc[user, "count"]) + 5.0)
-                for user in self.users
-            ],
-            dtype=float,
-        )
+        self.alignment = (
+            agreement["sum"].to_numpy(dtype=float) + 5.0 * base
+        ) / (agreement["count"].to_numpy(dtype=float) + 5.0)
         self.transition = self._build_transition(reference)
+        # Precomputed transpose so propagation does not re-transpose per step.
+        self.transition_t = self.transition.T.tocsr()
         self.dangling = np.asarray(self.transition.sum(axis=1)).ravel() == 0
 
     def _build_transition(self, reference: pd.DataFrame) -> sparse.csr_matrix:
         tenure = reference.groupby("username")["tenure_days_at_vote"].median()
         known_tenure = tenure.dropna()
         fallback = float(known_tenure.median()) if len(known_tenure) else 0.0
-        edge_counts: defaultdict[tuple[int, int], list[int]] = defaultdict(
-            lambda: [0, 0]
+        # Every unordered pair of distinct voters on the same item, built with a
+        # self-join instead of per-item Python combinations.
+        voters = reference.loc[reference["item_id"].notna(), ["item_id", "username", "vote"]]
+        voters = voters.assign(username=voters["username"].astype(str))
+        voters = voters.drop_duplicates(["item_id", "username"])
+        voters = voters.assign(
+            user=voters["username"].map(self.user_index).to_numpy(dtype=np.int64)
+        )[["item_id", "user", "vote"]]
+        pairs = voters.merge(voters, on="item_id", suffixes=("_left", "_right"))
+        pairs = pairs[pairs["user_left"] < pairs["user_right"]]
+        edges = (
+            pairs.assign(_agree=(pairs["vote_left"] == pairs["vote_right"]).astype(int))
+            .groupby(["user_left", "user_right"], sort=False)["_agree"]
+            .agg(["sum", "size"])
         )
-        for _, group in reference.groupby("item_id", sort=False):
-            rows = group[["username", "vote"]].drop_duplicates("username")
-            for left, right in combinations(rows.itertuples(index=False), 2):
-                left_index = self.user_index[str(left.username)]
-                right_index = self.user_index[str(right.username)]
-                key = (min(left_index, right_index), max(left_index, right_index))
-                edge_counts[key][0] += int(left.vote == right.vote)
-                edge_counts[key][1] += 1
+        left = edges.index.get_level_values(0).to_numpy(dtype=np.int64)
+        right = edges.index.get_level_values(1).to_numpy(dtype=np.int64)
+        n_agree = edges["sum"].to_numpy(dtype=float)
+        n_common = edges["size"].to_numpy(dtype=float)
 
-        rows = []
-        columns = []
-        values = []
-        for (left, right), (n_agree, n_common) in edge_counts.items():
-            agreement = (n_agree + 1.0) / (n_common + 2.0)
-            left_tenure = float(tenure.get(self.users[left], fallback))
-            right_tenure = float(tenure.get(self.users[right], fallback))
-            if not np.isfinite(left_tenure):
-                left_tenure = fallback
-            if not np.isfinite(right_tenure):
-                right_tenure = fallback
-            similarity = np.exp(
-                -abs(
-                    np.log1p(max(left_tenure, 0.0))
-                    - np.log1p(max(right_tenure, 0.0))
-                )
-                / 2.0
-            )
-            weight = agreement * np.log1p(n_common) * (0.5 + 0.5 * similarity)
-            if weight <= 0:
-                continue
-            rows.extend([left, right])
-            columns.extend([right, left])
-            values.extend([weight, weight])
+        tenure.index = tenure.index.astype(str)
+        user_tenure = tenure.reindex(self.users).to_numpy(dtype=float)
+        user_tenure = np.where(np.isfinite(user_tenure), user_tenure, fallback)
+        log_tenure = np.log1p(np.maximum(user_tenure, 0.0))
+        agreement = (n_agree + 1.0) / (n_common + 2.0)
+        similarity = np.exp(-np.abs(log_tenure[left] - log_tenure[right]) / 2.0)
+        weight = agreement * np.log1p(n_common) * (0.5 + 0.5 * similarity)
+        keep = weight > 0
+        left, right, weight = left[keep], right[keep], weight[keep]
+        rows = np.concatenate([left, right])
+        columns = np.concatenate([right, left])
+        values = np.concatenate([weight, weight])
         adjacency = sparse.csr_matrix(
             (values, (rows, columns)),
             shape=(len(self.users), len(self.users)),
@@ -163,26 +159,38 @@ class TopicConditionedPPR:
         return sparse.diags(inverse) @ adjacency
 
     def _propagate(self, personalization: np.ndarray) -> np.ndarray:
-        scores = personalization.copy()
+        return self._propagate_many(personalization[:, None])[:, 0]
+
+    def _propagate_many(self, personalization: np.ndarray) -> np.ndarray:
+        """Run power iteration for many restart vectors (one per column).
+
+        Each column stops exactly when its own single-vector iteration would.
+        """
+        result = np.array(personalization, dtype=float, copy=True)
+        active = np.arange(personalization.shape[1])
+        scores = result.copy()
+        restart = np.asarray(personalization, dtype=float)
         for _ in range(self.max_iter):
-            updated = self.damping * (self.transition.T @ scores)
-            updated += self.damping * scores[self.dangling].sum() * personalization
-            updated += (1.0 - self.damping) * personalization
-            if np.abs(updated - scores).sum() < self.tolerance:
-                return np.asarray(updated, dtype=float)
-            scores = np.asarray(updated, dtype=float)
-        return scores
+            if not len(active):
+                break
+            current = scores[:, active]
+            columns = restart[:, active]
+            updated = self.damping * (self.transition_t @ current)
+            updated += self.damping * current[self.dangling].sum(axis=0) * columns
+            updated += (1.0 - self.damping) * columns
+            converged = np.abs(updated - current).sum(axis=0) < self.tolerance
+            scores[:, active] = updated
+            result[:, active[converged]] = updated[:, converged]
+            active = active[~converged]
+        result[:, active] = scores[:, active]
+        return result
 
     def global_scores(self) -> dict[str, float]:
         personalization = np.maximum(self.alignment - 0.40, 0.01)
         personalization /= personalization.sum()
         return dict(zip(self.users, self._propagate(personalization)))
 
-    def _case_percentiles(self, item_id: object) -> np.ndarray:
-        key = str(item_id)
-        cached = self._case_cache.get(key)
-        if cached is not None:
-            return cached
+    def _personalization(self, item_id: object) -> np.ndarray:
         content, _ = self.encoder.content_vector(item_id)
         norm = float(np.linalg.norm(content))
         if norm > 0:
@@ -191,24 +199,43 @@ class TopicConditionedPPR:
             affinity = np.full(len(self.users), 0.5, dtype=float)
         personalization = np.exp(2.0 * affinity) * (0.25 + 0.75 * self.alignment)
         personalization /= personalization.sum()
-        scores = self._propagate(personalization)
+        return personalization
+
+    def precompute(self, item_ids, batch_size: int = 256) -> None:
+        """Propagate many uncached cases at once; results equal the lazy path."""
+        pending = list(
+            dict.fromkeys(str(item) for item in item_ids if str(item) not in self._case_cache)
+        )
+        for start in range(0, len(pending), batch_size):
+            keys = pending[start : start + batch_size]
+            restart = np.column_stack([self._personalization(key) for key in keys])
+            propagated = self._propagate_many(restart)
+            for column, key in enumerate(keys):
+                self._case_cache[key] = self._percentiles(propagated[:, column])
+
+    @staticmethod
+    def _percentiles(scores: np.ndarray) -> np.ndarray:
         order = np.argsort(scores, kind="stable")
         percentiles = np.empty(len(scores), dtype=float)
         percentiles[order] = (np.arange(len(scores), dtype=float) + 1.0) / len(scores)
+        return percentiles
+
+    def _case_percentiles(self, item_id: object) -> np.ndarray:
+        key = str(item_id)
+        cached = self._case_cache.get(key)
+        if cached is not None:
+            return cached
+        percentiles = self._percentiles(self._propagate(self._personalization(item_id)))
         self._case_cache[key] = percentiles
         return percentiles
 
-    def scores_for(self, item_id: object, usernames: pd.Series) -> np.ndarray:
+    def scores_for(self, item_id: object, usernames) -> np.ndarray:
         percentiles = self._case_percentiles(item_id)
-        return np.asarray(
-            [
-                percentiles[self.user_index[str(username)]]
-                if str(username) in self.user_index
-                else 0.5
-                for username in usernames
-            ],
-            dtype=float,
+        indices = np.fromiter(
+            (self.user_index.get(str(username), -1) for username in usernames),
+            dtype=np.intp,
         )
+        return np.where(indices >= 0, percentiles[indices], 0.5)
 
 
 def _percentile_map(values: dict[str, float]) -> dict[str, float]:
@@ -235,35 +262,6 @@ def attach_static_attention(
     return out
 
 
-def attach_case_affinity(
-    candidates: pd.DataFrame,
-    item_id: object,
-    encoder: PostContextEncoder,
-    centroids: dict[str, np.ndarray],
-) -> pd.DataFrame:
-    """Measure post/user affinity from prefix-only content histories."""
-    out = candidates.copy()
-    content, _ = encoder.content_vector(item_id)
-    norm = float(np.linalg.norm(content))
-    if norm <= 0:
-        out["attention_case_affinity"] = 0.5
-        return out
-    normalized = content / norm
-    out["attention_case_affinity"] = np.clip(
-        [
-            (
-                float(centroids.get(str(username), np.zeros_like(normalized)) @ normalized)
-                + 1.0
-            )
-            / 2.0
-            for username in out["username"]
-        ],
-        0.0,
-        1.0,
-    )
-    return out
-
-
 def form_graph_team(
     item_id: object,
     community: str,
@@ -277,26 +275,32 @@ def form_graph_team(
     team_size: int,
 ) -> tuple[dict, pd.DataFrame]:
     """Select top-k graph-attention candidates, then simulate their votes."""
-    annotated = attach_case_affinity(
-        candidates,
-        item_id,
-        simulator.encoder,
-        centroids,
-    )
-    annotated["attention_graph"] = topic_ppr.scores_for(
-        item_id,
-        annotated["username"],
-    )
-    annotated["attention_logit"] = 0.0
+    # Score the whole pool on arrays; only the selected team becomes a frame.
+    usernames = candidates["username"].astype(str).tolist()
+    content, _ = simulator.encoder.content_vector(item_id)
+    if float(np.linalg.norm(content)) > 0:
+        case_affinity = np.clip(centroid_affinities(usernames, centroids, content), 0.0, 1.0)
+    else:
+        case_affinity = np.full(len(usernames), 0.5, dtype=float)
+    computed = {
+        "attention_case_affinity": case_affinity,
+        "attention_graph": topic_ppr.scores_for(item_id, usernames),
+    }
+    logits = np.zeros(len(usernames), dtype=float)
     for component, weight in component_weights.items():
-        annotated["attention_logit"] += weight * annotated[component]
-    ranked = annotated.sort_values(
-        ["attention_logit", "username"],
-        ascending=[False, True],
-        kind="stable",
+        values = computed.get(component)
+        if values is None:
+            values = candidates[component].to_numpy(dtype=float)
+        logits += weight * values
+    selected = stable_top_indices(logits, usernames, team_size)
+    team = with_columns(
+        candidates.iloc[selected],
+        trailing={
+            **{column: values[selected] for column, values in computed.items()},
+            "attention_logit": logits[selected],
+        },
     )
-    team = ranked.head(min(team_size, len(ranked))).copy()
-    users = team["username"].astype(str).tolist()
+    users = [usernames[index] for index in selected]
     simulated_scores = simulator.predict_scores(item_id, community, users)
     simulated_votes = np.where(simulated_scores >= 0, 1, -1)
     logits = team["attention_logit"].to_numpy(dtype=float)
@@ -314,12 +318,17 @@ def form_graph_team(
         "effective_team_size": float(1.0 / np.square(weights).sum()),
         "eligible": True,
     }
-    team.insert(0, "item_id", item_id)
-    team["label"] = int(label)
-    team["simulated_vote_score"] = simulated_scores
-    team["simulated_vote"] = simulated_votes
-    team["attention_weight"] = weights
-    team["selected_rank"] = np.arange(1, len(team) + 1)
+    team = with_columns(
+        team,
+        {"item_id": item_id},
+        {
+            "label": int(label),
+            "simulated_vote_score": simulated_scores,
+            "simulated_vote": simulated_votes,
+            "attention_weight": weights,
+            "selected_rank": np.arange(1, len(team) + 1),
+        },
+    )
     return item, team
 
 
@@ -342,6 +351,12 @@ def score_cases(
     )
     item_rows = []
     member_rows = []
+    topic_ppr.precompute(
+        row.item_id
+        for row in ordered.itertuples(index=False)
+        if str(row.community) in candidate_pools
+    )
+    prepared: dict[str, pd.DataFrame] = {}
     for row in ordered.itertuples(index=False):
         pool = candidate_pools.get(str(row.community))
         if pool is None or pool.empty:
@@ -360,13 +375,16 @@ def score_cases(
                 }
             )
             continue
-        candidates = pool.head(max_candidates) if max_candidates > 0 else pool
+        candidates = prepared.get(str(row.community))
+        if candidates is None:
+            candidates = pool.head(max_candidates) if max_candidates > 0 else pool
+            candidates = prepared[str(row.community)] = candidates.reset_index(drop=True)
         item, members = form_graph_team(
             row.item_id,
             str(row.community),
             int(row.label),
             row.timestamp,
-            candidates.reset_index(drop=True),
+            candidates,
             simulator,
             centroids,
             topic_ppr,

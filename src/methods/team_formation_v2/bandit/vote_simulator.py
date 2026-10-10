@@ -27,6 +27,9 @@ class PostContextEncoder:
         self.scale: np.ndarray | None = None
         self.communities: list[str] = []
         self.community_index: dict[str, int] = {}
+        # Per-item PCA projections are deterministic, so memoize them: every
+        # pipeline re-encodes the same cases thousands of times.
+        self._content_cache: dict[str, tuple[np.ndarray, bool]] = {}
 
     def fit(self, votes: pd.DataFrame) -> "PostContextEncoder":
         ids_path = self.embedding_dir / "post_ids.json"
@@ -69,6 +72,7 @@ class PostContextEncoder:
         self.community_index = {
             community: index for index, community in enumerate(self.communities)
         }
+        self._content_cache = {}
         return self
 
     @property
@@ -82,26 +86,37 @@ class PostContextEncoder:
     def content_vector(self, item_id: object) -> tuple[np.ndarray, bool]:
         if self.reducer is None or self.embeddings is None or self.scale is None:
             raise RuntimeError("PostContextEncoder.fit must be called before transform")
-        index = self.post_ids.get(str(item_id))
+        key = str(item_id)
+        cached = self._content_cache.get(key)
+        if cached is not None:
+            return cached
+        index = self.post_ids.get(key)
         if index is None:
-            return np.zeros(self.content_dimensions, dtype=float), False
-        raw = np.asarray(self.embeddings[index], dtype=np.float32).reshape(1, -1)
-        reduced = self.reducer.transform(raw)[0]
-        return np.tanh(reduced / (3.0 * self.scale)).astype(float), True
+            vector, found = np.zeros(self.content_dimensions, dtype=float), False
+        else:
+            raw = np.asarray(self.embeddings[index], dtype=np.float32).reshape(1, -1)
+            reduced = self.reducer.transform(raw)[0]
+            vector, found = np.tanh(reduced / (3.0 * self.scale)).astype(float), True
+        # Shared across callers, so guard against accidental in-place edits.
+        vector.setflags(write=False)
+        self._content_cache[key] = (vector, found)
+        return vector, found
 
     def transform(self, item_ids: pd.Series, communities: pd.Series) -> np.ndarray:
-        rows = []
-        for item_id, community in zip(item_ids, communities):
-            content, _ = self.content_vector(item_id)
-            one_hot = np.zeros(len(self.communities), dtype=float)
+        item_ids = list(item_ids)
+        communities = list(communities)
+        content_dimensions = self.content_dimensions
+        rows = np.zeros((len(item_ids), self.output_dimensions), dtype=float)
+        rows[:, 0] = 1.0
+        for row, (item_id, community) in enumerate(zip(item_ids, communities)):
+            rows[row, 1 : 1 + content_dimensions] = self.content_vector(item_id)[0]
             community_index = self.community_index.get(str(community))
             if community_index is not None:
-                one_hot[community_index] = 1.0
-            rows.append(np.concatenate(([1.0], content, one_hot)))
-        return np.asarray(rows, dtype=float)
+                rows[row, 1 + content_dimensions + community_index] = 1.0
+        return rows
 
     def one(self, item_id: object, community: object) -> np.ndarray:
-        return self.transform(pd.Series([item_id]), pd.Series([community]))[0]
+        return self.transform([item_id], [community])[0]
 
     def coverage(self, votes: pd.DataFrame) -> float:
         item_ids = votes["item_id"].astype(str).drop_duplicates()
@@ -125,6 +140,10 @@ class HierarchicalVoteSimulator:
         self.global_coef: np.ndarray | None = None
         self.user_offsets: dict[str, np.ndarray] = {}
         self.user_counts: dict[str, int] = {}
+        # Row ``i`` holds global_coef + offset for user i; the final row is the
+        # global fallback for users without a personal head.
+        self._coefficients: np.ndarray | None = None
+        self._coefficient_rows: dict[str, int] = {}
 
     @staticmethod
     def _solve(matrix: np.ndarray, target: np.ndarray, ridge: float) -> np.ndarray:
@@ -146,8 +165,30 @@ class HierarchicalVoteSimulator:
             residual = target[idx] - global_prediction[idx]
             # Stronger shrinkage for users with little personal history.
             ridge = self.user_ridge * max(self.min_user_votes / len(idx), 0.25)
-            self.user_offsets[str(username)] = self._solve(design[idx], residual, ridge)
+            # Columns that are zero for every one of this user's votes (mostly
+            # other communities' one-hot slots) decouple from the ridge system
+            # and solve to exactly zero, so only the active block is solved.
+            # The intercept column is always active, keeping its penalty at 0.
+            user_design = design[idx]
+            active = np.flatnonzero(np.any(user_design != 0.0, axis=0))
+            offset = np.zeros(design.shape[1], dtype=float)
+            offset[active] = self._solve(user_design[:, active], residual, ridge)
+            self.user_offsets[str(username)] = offset
+        users = list(self.user_offsets)
+        self._coefficient_rows = {user: row for row, user in enumerate(users)}
+        self._coefficients = np.vstack(
+            [self.global_coef + self.user_offsets[user] for user in users]
+            + [self.global_coef]
+        )
         return self
+
+    def _coefficient_indices(self, usernames) -> np.ndarray:
+        fallback = len(self._coefficient_rows)
+        rows = self._coefficient_rows
+        return np.fromiter(
+            (rows.get(str(username), fallback) for username in usernames),
+            dtype=np.intp,
+        )
 
     def predict_scores(
         self,
@@ -158,25 +199,16 @@ class HierarchicalVoteSimulator:
         if self.global_coef is None:
             raise RuntimeError("HierarchicalVoteSimulator.fit must be called first")
         context = self.encoder.one(item_id, community)
-        scores = np.empty(len(usernames), dtype=float)
-        for index, username in enumerate(usernames):
-            offset = self.user_offsets.get(str(username))
-            coefficient = self.global_coef if offset is None else self.global_coef + offset
-            scores[index] = float(context @ coefficient)
+        scores = self._coefficients[self._coefficient_indices(usernames)] @ context
         return np.clip(scores, -1.0, 1.0)
 
     def evaluate_observed(self, votes: pd.DataFrame) -> dict:
         """Measure simulator fidelity only where a historical vote is observed."""
-        scores = np.empty(len(votes), dtype=float)
-        for (_, group), indices in zip(
-            votes.groupby(["item_id", "community"], sort=False),
-            votes.groupby(["item_id", "community"], sort=False).indices.values(),
-        ):
-            idx = np.asarray(indices, dtype=int)
-            first = votes.iloc[idx[0]]
-            scores[idx] = self.predict_scores(
-                first["item_id"], first["community"], votes.iloc[idx]["username"].tolist()
-            )
+        if self._coefficients is None:
+            raise RuntimeError("HierarchicalVoteSimulator.fit must be called first")
+        contexts = self.encoder.transform(votes["item_id"], votes["community"])
+        coefficients = self._coefficients[self._coefficient_indices(votes["username"])]
+        scores = np.clip(np.einsum("ij,ij->i", contexts, coefficients), -1.0, 1.0)
         target = votes["vote"].to_numpy(dtype=int)
         prediction = np.where(scores >= 0, 1, -1)
         result = {

@@ -9,27 +9,20 @@ import pandas as pd
 from src.methods.team_formation_v2.role_utils import FamiliarityKey, crowding_distance
 
 
-def _dominates(left: tuple[float, ...], right: tuple[float, ...]) -> bool:
-    return all(a >= b for a, b in zip(left, right)) and any(
-        a > b for a, b in zip(left, right)
-    )
-
-
 def nondominated_sort(objectives: list[tuple[float, ...]]) -> list[list[int]]:
     """Return ordinary Pareto fronts over all four specified objectives."""
-    dominates = [set() for _ in objectives]
-    dominated_count = [0] * len(objectives)
-    fronts = [[]]
-    for left_index, left in enumerate(objectives):
-        for right_index, right in enumerate(objectives):
-            if left_index == right_index:
-                continue
-            if _dominates(left, right):
-                dominates[left_index].add(right_index)
-            elif _dominates(right, left):
-                dominated_count[left_index] += 1
-        if dominated_count[left_index] == 0:
-            fronts[0].append(left_index)
+    if not objectives:
+        return []
+    values = np.asarray(objectives, dtype=float)
+    # matrix[i, j] is True when i is >= j on every objective and > on one.
+    matrix = (values[:, None, :] >= values[None, :, :]).all(axis=2) & (
+        values[:, None, :] > values[None, :, :]
+    ).any(axis=2)
+    # Sets are filled in ascending order, exactly as the pairwise loop did, so
+    # their iteration order (and therefore front order) is unchanged.
+    dominates = [set(np.flatnonzero(row).tolist()) for row in matrix]
+    dominated_count = matrix.sum(axis=0).tolist()
+    fronts = [[index for index, count in enumerate(dominated_count) if count == 0]]
     rank = 0
     while fronts[rank]:
         following = []
@@ -41,6 +34,24 @@ def nondominated_sort(objectives: list[tuple[float, ...]]) -> list[list[int]]:
         rank += 1
         fronts.append(following)
     return fronts[:-1]
+
+
+_PAIR_CACHE: dict[int, tuple[dict, dict[str, list]]] = {}
+
+
+def _community_pairs(
+    familiarity: dict[FamiliarityKey, float],
+) -> dict[str, list[tuple[tuple[str, str], float]]]:
+    """Group familiarity pairs by community once per familiarity table."""
+    cached = _PAIR_CACHE.get(id(familiarity))
+    if cached is not None and cached[0] is familiarity:
+        return cached[1]
+    grouped: dict[str, list[tuple[tuple[str, str], float]]] = {}
+    for (community, left, right), count in familiarity.items():
+        grouped.setdefault(community, []).append(((left, right), count))
+    _PAIR_CACHE.clear()
+    _PAIR_CACHE[id(familiarity)] = (familiarity, grouped)
+    return grouped
 
 
 class CommunityNSGA2Optimizer:
@@ -63,6 +74,7 @@ class CommunityNSGA2Optimizer:
         self.generations = int(generations)
         self.community = str(self.candidates.iloc[0]["community"])
         users = self.candidates["username"].astype(str).tolist()
+        self.usernames = users
 
         ideology_dimension = len(next(iter(ideology.values()))) if ideology else 1
         vectors = np.vstack(
@@ -80,12 +92,19 @@ class CommunityNSGA2Optimizer:
             dtype=float,
         )
         scale = max(float(familiarity_scales.get(self.community, 1.0)), 1.0)
-        for left in range(self.n_candidates):
-            for right in range(left + 1, self.n_candidates):
-                key = (self.community, *sorted((users[left], users[right])))
-                value = familiarity.get(key, 0.0) / scale
-                self.familiarity_matrix[left, right] = value
-                self.familiarity_matrix[right, left] = value
+        # Visit only this community's observed pairs instead of all n^2 pairs;
+        # unobserved pairs keep familiarity 0.
+        position = {user: index for index, user in enumerate(users)}
+        for (left_user, right_user), count in _community_pairs(familiarity).get(
+            self.community, ()
+        ):
+            left = position.get(left_user)
+            right = position.get(right_user)
+            if left is None or right is None or left == right:
+                continue
+            value = count / scale
+            self.familiarity_matrix[left, right] = value
+            self.familiarity_matrix[right, left] = value
 
         # Relative bands avoid imposing a universal agreement threshold on
         # communities with different moderator base rates.
@@ -110,24 +129,31 @@ class CommunityNSGA2Optimizer:
         if len(expertise) != self.n_candidates:
             raise ValueError("Expertise length does not match the candidate pool")
         objective_cache: dict[tuple[int, ...], tuple[float, ...]] = {}
+        upper_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
 
         def evaluate(indices: tuple[int, ...]) -> tuple[float, ...]:
             cached = objective_cache.get(indices)
             if cached is not None:
                 return cached
             selected = np.asarray(indices, dtype=int)
-            upper = np.triu_indices(len(selected), k=1)
-            ideology = self.ideology_matrix[np.ix_(selected, selected)][upper]
-            familiar = self.familiarity_matrix[np.ix_(selected, selected)][upper]
+            upper = upper_cache.get(len(selected))
+            if upper is None:
+                upper = upper_cache[len(selected)] = np.triu_indices(len(selected), k=1)
+            # Same elements, in the same order, as matrix[np.ix_(s, s)][upper];
+            # sum()/n is exactly what ndarray.mean() computes.
+            left, right = selected[upper[0]], selected[upper[1]]
+            n_pairs = len(left)
+            ideology = self.ideology_matrix[left, right]
+            familiar = self.familiarity_matrix[left, right]
             objectives = (
-                float(ideology.mean()) if len(ideology) else 0.0,
-                float(expertise[selected].mean()),
+                float(ideology.sum() / n_pairs) if n_pairs else 0.0,
+                float(expertise[selected].sum() / len(selected)),
                 0.5
                 * (
                     float(self.high_alignment[selected].any())
                     + float(self.mid_alignment[selected].any())
                 ),
-                float(familiar.mean()) if len(familiar) else 0.0,
+                float(familiar.sum() / n_pairs) if n_pairs else 0.0,
             )
             objective_cache[indices] = objectives
             return objectives
@@ -182,10 +208,17 @@ class CommunityNSGA2Optimizer:
                 )
                 if rng.rand() < 0.25:
                     selected_set = set(child)
-                    remove = int(rng.choice(sorted(selected_set)))
-                    available = sorted(set(range(self.n_candidates)) - selected_set)
+                    members = sorted(selected_set)
+                    remove = int(rng.choice(members))
+                    # Same draw as rng.choice(sorted(all - child)) without
+                    # materializing the whole candidate range: map the index
+                    # to the matching non-member in ascending order.
+                    added = int(rng.randint(0, self.n_candidates - len(members)))
+                    for member in members:
+                        if member <= added:
+                            added += 1
                     selected_set.remove(remove)
-                    selected_set.add(int(rng.choice(available)))
+                    selected_set.add(added)
                     child = tuple(sorted(selected_set))
                 offspring.append(child)
 

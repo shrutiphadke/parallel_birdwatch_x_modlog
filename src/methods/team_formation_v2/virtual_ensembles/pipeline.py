@@ -27,7 +27,7 @@ from src.methods.team_formation_v2.bandit.vote_simulator import (  # noqa: E402
     PostContextEncoder,
 )
 from src.methods.team_formation_v2.role_nsga2.pipeline import (  # noqa: E402
-    attach_case_expertise,
+    case_topic_affinity,
     fit_user_topic_centroids,
 )
 from src.methods.team_formation_v2.shared_features import (  # noqa: E402
@@ -36,6 +36,8 @@ from src.methods.team_formation_v2.shared_features import (  # noqa: E402
     calibrate_thresholds_per_community,
     classification_metrics,
     load_and_enrich_splits,
+    stable_top_indices,
+    with_columns,
 )
 
 DEFAULT_VOTES_DIR = "data/splits/reddit/intersection_chronological"
@@ -48,37 +50,49 @@ TEAM_NAMES = (
 CONSENSUS_FEATURES = [f"consensus_{name}" for name in TEAM_NAMES]
 
 
-def _stable_top(group: pd.DataFrame, score: pd.Series, team_size: int) -> pd.DataFrame:
+def _stable_top(
+    group: pd.DataFrame,
+    usernames: list[str],
+    score: np.ndarray,
+    team_size: int,
+    extra_columns: dict[str, np.ndarray] | None = None,
+) -> pd.DataFrame:
     """Select a deterministic top-k without using current-case votes."""
-    ranked = group.assign(profile_match=score.to_numpy(dtype=float)).sort_values(
-        ["profile_match", "username"],
-        ascending=[False, True],
-        kind="stable",
-    )
-    return ranked.head(min(team_size, len(ranked)))
+    selected = stable_top_indices(score, usernames, team_size)
+    trailing = {name: values[selected] for name, values in (extra_columns or {}).items()}
+    trailing["profile_match"] = score[selected]
+    return with_columns(group.iloc[selected], trailing=trailing)
+
+
+def _team_scores(
+    tenure: np.ndarray,
+    local_activity: np.ndarray,
+    topical_expertise: np.ndarray,
+    alignment: np.ndarray,
+) -> dict[str, np.ndarray]:
+    """Profile-match scores for exactly the two teams in the specification."""
+    return {
+        "high_tenure_low_activity": np.sqrt(
+            np.clip(tenure, 0, 1) * (1.0 - np.clip(local_activity, 0, 1))
+        ),
+        "domain_expert_high_moderator_agreement": np.sqrt(
+            np.clip(topical_expertise, 0, 1) * np.clip(alignment, 0, 1)
+        ),
+    }
 
 
 def select_virtual_teams(candidates: pd.DataFrame, team_size: int) -> dict[str, pd.DataFrame]:
     """Construct exactly the two complementary profiles in the specification."""
-    tenure_low_activity = np.sqrt(
-        candidates["profile_tenure"].clip(0, 1)
-        * (1.0 - candidates["profile_local_activity"].clip(0, 1))
+    scores = _team_scores(
+        candidates["profile_tenure"].to_numpy(dtype=float),
+        candidates["profile_local_activity"].to_numpy(dtype=float),
+        candidates["topical_expertise"].to_numpy(dtype=float),
+        candidates["profile_alignment_local"].to_numpy(dtype=float),
     )
-    expert_aligned = np.sqrt(
-        candidates["topical_expertise"].clip(0, 1)
-        * candidates["profile_alignment_local"].clip(0, 1)
-    )
+    usernames = candidates["username"].astype(str).tolist()
     return {
-        "high_tenure_low_activity": _stable_top(
-            candidates,
-            tenure_low_activity,
-            team_size,
-        ),
-        "domain_expert_high_moderator_agreement": _stable_top(
-            candidates,
-            expert_aligned,
-            team_size,
-        ),
+        name: _stable_top(candidates, usernames, score, team_size)
+        for name, score in scores.items()
     }
 
 
@@ -90,9 +104,11 @@ def build_case_features(
     candidates: pd.DataFrame,
     simulator: HierarchicalVoteSimulator,
     team_size: int,
+    teams: dict[str, pd.DataFrame] | None = None,
 ) -> tuple[dict, pd.DataFrame]:
     """Simulate the union of selected panels and summarize each team."""
-    teams = select_virtual_teams(candidates, team_size)
+    if teams is None:
+        teams = select_virtual_teams(candidates, team_size)
     union_users = list(
         dict.fromkeys(
             user
@@ -122,13 +138,17 @@ def build_case_features(
         row[f"consensus_{team_name}"] = float(soft.mean())
         row[f"binary_consensus_{team_name}"] = float(binary.mean())
         row[f"size_{team_name}"] = int(len(team))
-        annotated = team.copy()
-        annotated.insert(0, "item_id", item_id)
-        annotated["label"] = int(label)
-        annotated["team_name"] = team_name
-        annotated["simulated_vote_score"] = [score_lookup[user] for user in users]
-        annotated["simulated_vote"] = binary.astype(int)
-        annotated["selected_rank"] = np.arange(1, len(team) + 1)
+        annotated = with_columns(
+            team,
+            {"item_id": item_id},
+            {
+                "label": int(label),
+                "team_name": team_name,
+                "simulated_vote_score": soft,
+                "simulated_vote": binary.astype(int),
+                "selected_rank": np.arange(1, len(team) + 1),
+            },
+        )
         membership_rows.append(annotated)
 
     membership = pd.concat(membership_rows, ignore_index=True)
@@ -152,25 +172,42 @@ def build_features(
     )
     rows = []
     members = []
+    # Per-community pool arrays are static; only topic affinity changes per case,
+    # so teams are scored on arrays (same as attach_case_expertise followed by
+    # select_virtual_teams) and frames are built for selected members only.
+    prepared: dict[str, tuple] = {}
     for case in ordered.itertuples(index=False):
         pool = candidate_pools.get(str(case.community))
         if pool is None or pool.empty:
             continue
-        pool = pool.head(max_candidates) if max_candidates > 0 else pool
-        candidates = attach_case_expertise(
-            pool.reset_index(drop=True),
-            case.item_id,
-            simulator.encoder,
-            centroids,
-        )
+        if str(case.community) not in prepared:
+            pool = pool.head(max_candidates) if max_candidates > 0 else pool
+            pool = pool.reset_index(drop=True)
+            prepared[str(case.community)] = (
+                pool,
+                pool["username"].astype(str).tolist(),
+                pool["profile_tenure"].to_numpy(dtype=float),
+                pool["profile_local_activity"].to_numpy(dtype=float),
+                pool["profile_alignment_local"].to_numpy(dtype=float),
+            )
+        pool, usernames, tenure, local_activity, alignment = prepared[str(case.community)]
+        affinity = case_topic_affinity(usernames, case.item_id, simulator.encoder, centroids)
+        affinity_columns = {"case_topic_affinity": affinity, "topical_expertise": affinity}
+        teams = {
+            name: _stable_top(pool, usernames, score, team_size, affinity_columns)
+            for name, score in _team_scores(
+                tenure, local_activity, affinity, alignment
+            ).items()
+        }
         row, membership = build_case_features(
             case.item_id,
             str(case.community),
             int(case.label),
             case.timestamp,
-            candidates,
+            pool,
             simulator,
             team_size,
+            teams=teams,
         )
         rows.append(row)
         members.append(membership)

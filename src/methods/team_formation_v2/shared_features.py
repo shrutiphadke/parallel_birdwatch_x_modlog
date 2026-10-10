@@ -53,6 +53,77 @@ def unix_seconds(values: pd.Series) -> pd.Series:
     return parsed.map(lambda value: value.timestamp() if pd.notna(value) else np.nan)
 
 
+def stable_top_indices(scores: np.ndarray, usernames: list[str], k: int) -> np.ndarray:
+    """Positions of the top-k rows ordered by score descending, then username.
+
+    Equivalent to ``sort_values([score, "username"], ascending=[False, True])``
+    followed by ``head(k)`` for unique usernames, without sorting the strings of
+    the whole candidate pool on every case.
+    """
+    values = np.asarray(scores, dtype=float)
+    k = min(int(k), len(values))
+    if k <= 0:
+        return np.asarray([], dtype=int)
+    if np.isnan(values).any():
+        # Rare path: keep pandas' NaN-last semantics exactly.
+        ranked = pd.DataFrame({"score": values, "username": usernames}).sort_values(
+            ["score", "username"], ascending=[False, True], kind="stable"
+        )
+        return ranked.index.to_numpy()[:k]
+    order = np.argsort(-values, kind="stable")
+    cutoff = values[order[k - 1]]
+    chosen = np.flatnonzero(values > cutoff).tolist()
+    tied = sorted(np.flatnonzero(values == cutoff).tolist(), key=lambda i: usernames[i])
+    picked = chosen + tied[: k - len(chosen)]
+    picked.sort(key=lambda i: (-values[i], usernames[i]))
+    return np.asarray(picked, dtype=int)
+
+
+def with_columns(
+    base: pd.DataFrame,
+    leading: dict[str, object] | None = None,
+    trailing: dict[str, object] | None = None,
+) -> pd.DataFrame:
+    """Return ``base`` with new columns before and after it, built in one pass.
+
+    Equivalent to ``insert(0, ...)`` / ``frame[name] = value`` per column, but
+    avoids one copy-on-write block rebuild per assignment on hot per-case paths.
+    """
+    parts = []
+    if leading:
+        parts.append(pd.DataFrame(leading, index=base.index))
+    parts.append(base)
+    if trailing:
+        parts.append(pd.DataFrame(trailing, index=base.index))
+    return pd.concat(parts, axis=1) if len(parts) > 1 else base.copy()
+
+
+def centroid_affinities(
+    usernames: list[str],
+    centroids: dict[str, np.ndarray],
+    content: np.ndarray,
+) -> np.ndarray:
+    """Return ``(cos(user centroid, content) + 1) / 2`` for each user, unclipped."""
+    if len(usernames) == 0:
+        return np.asarray([], dtype=float)
+    normalized = content / float(np.linalg.norm(content))
+    key = (id(centroids), tuple(usernames))
+    cached = _CENTROID_MATRICES.get(key)
+    # Keep the dict itself in the cache so its id cannot be reused.
+    if cached is None or cached[0] is not centroids:
+        zero = np.zeros_like(normalized)
+        matrix = np.vstack([centroids.get(str(user), zero) for user in usernames])
+        if len(_CENTROID_MATRICES) >= 4096:
+            _CENTROID_MATRICES.clear()
+        _CENTROID_MATRICES[key] = (centroids, matrix)
+    else:
+        matrix = cached[1]
+    return (matrix @ normalized + 1.0) / 2.0
+
+
+_CENTROID_MATRICES: dict[tuple, tuple[dict, np.ndarray]] = {}
+
+
 def load_causal_features(path: Path = DEFAULT_CAUSAL_FEATURES) -> pd.DataFrame:
     """Load and validate one causal feature row per historical vote."""
     if not path.exists():
@@ -336,6 +407,37 @@ def compute_ppr_scores(
     return dict(zip(users, scores.astype(float)))
 
 
+def _macro_f1_grid(
+    values: np.ndarray,
+    labels: np.ndarray,
+    grid: np.ndarray,
+) -> np.ndarray | None:
+    """Macro F1 of ``values >= threshold`` for every threshold at once.
+
+    Reproduces sklearn's binary macro F1 (per-class ``2 tp / (true + pred)``,
+    zero when undefined, then the mean over classes -1 and 1). Returns None
+    when the labels are not exactly {-1, 1}, so callers fall back to sklearn.
+    """
+    if not len(values) or set(np.unique(labels).tolist()) != {-1, 1}:
+        return None
+    positive = labels == 1
+    n = len(values)
+    true_pos = float(positive.sum())
+    true_neg = float(n - positive.sum())
+    predicted = values[None, :] >= grid[:, None]
+    pred_pos = predicted.sum(axis=1)
+    tp_pos = (predicted & positive[None, :]).sum(axis=1)
+    tp_neg = (~predicted & ~positive[None, :]).sum(axis=1)
+    pred_neg = n - pred_pos
+
+    def f_score(tp: np.ndarray, true: float, pred: np.ndarray) -> np.ndarray:
+        denominator = 1.0 * true + pred.astype(float)
+        safe = np.where(denominator == 0, 1.0, denominator)
+        return np.where(denominator == 0, 0.0, 2.0 * tp.astype(float) / safe)
+
+    return (f_score(tp_neg, true_neg, pred_neg) + f_score(tp_pos, true_pos, pred_pos)) / 2
+
+
 def calibrate_thresholds_per_community(
     validation_scores: pd.DataFrame,
     min_items: int = 20,
@@ -349,9 +451,13 @@ def calibrate_thresholds_per_community(
         values = frame["score"].to_numpy(dtype=float)
         labels = frame["label"].to_numpy()
         grid = np.linspace(values.min(), values.max(), grid_size) if len(values) else np.array([0.0])
-        return float(max(grid, key=lambda threshold: f1_score(
-            labels, np.where(values >= threshold, 1, -1), average="macro"
-        )))
+        scores = _macro_f1_grid(values, labels, grid)
+        if scores is None:
+            return float(max(grid, key=lambda threshold: f1_score(
+                labels, np.where(values >= threshold, 1, -1), average="macro"
+            )))
+        # argmax keeps the first maximum, matching max() over the grid.
+        return float(grid[int(np.argmax(scores))])
 
     global_threshold = best_threshold(validation_scores)
     thresholds = {
