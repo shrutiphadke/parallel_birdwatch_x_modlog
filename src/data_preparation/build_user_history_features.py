@@ -681,7 +681,10 @@ def _read_parquet_parts(path: Path, columns: Optional[list[str]] = None) -> pd.D
         return pd.read_parquet(path)
     schema_path = next(path.glob("*.parquet"), None) if path.is_dir() else path
     if schema_path is None:
-        raise ValueError(f"No Parquet parts found under {path}")
+        # Partitioned writers emit no part for an empty table (e.g. a reply
+        # graph where no comment's parent resolves to another sampled user).
+        print(f"WARNING: no Parquet parts under {path}; treating it as empty")
+        return pd.DataFrame({column: pd.Series(dtype=object) for column in columns})
     available = set(pq.ParquetFile(schema_path).schema_arrow.names)
     aliases = {"timestamp": "created_utc", "item_id": "thing_id"}
     projected = [
