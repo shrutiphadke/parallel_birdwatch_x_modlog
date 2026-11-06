@@ -13,12 +13,12 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import StratifiedKFold
 
+from src.layout import ITEM_TEXT_COLUMNS, REDDIT, load_item_scores, load_items
 from src.utils.tabular import read_table, unix_seconds
 
-INPUT_PATH = Path("data/processed/final_intersection_dataset.csv")
-OUTPUT_DIR = Path("data/interim/reddit/datasets")
-AUXILIARY_DIR = Path("data/interim/reddit/auxiliary")
-SPLITS_DIR = Path("data/splits/reddit")
+INPUT_PATH = REDDIT.default_inputs().votes
+OUTPUT_DIR = REDDIT.datasets_dir
+SPLITS_DIR = REDDIT.splits
 
 MIN_VOTES_PER_POST = 5
 MIN_VOTES_PER_USER = 10
@@ -70,9 +70,9 @@ def load_dataset(path: Path = INPUT_PATH) -> pd.DataFrame:
     df["vote"] = df["vote"].astype("int8")
     df["label"] = df["label"].astype("int8")
     df["timestamp"] = unix_seconds(df["timestamp"]).astype("float64")
-    df[["username", "community", "item_id"]] = df[
-        ["username", "community", "item_id"]
-    ].astype("string")
+    df[["username", "community", "item_id"]] = df[["username", "community", "item_id"]].astype(
+        "string"
+    )
 
     before = len(df)
     df = df.dropna(subset=_CORE_COLUMNS)
@@ -166,7 +166,7 @@ def identify_method_filters(
     }
 
     if external_scores_path is not None and external_scores_path.exists():
-        ext = read_table(external_scores_path, columns=["item_id"])
+        ext = load_item_scores(external_scores_path)
         items_ext = items_bl & set(ext["item_id"].dropna().unique())
         missing_ext = len(items_bl) - len(items_ext)
     else:
@@ -211,7 +211,7 @@ def identify_method_filters(
     }
 
     if post_texts_path is not None and post_texts_path.exists():
-        post_texts = read_table(post_texts_path, columns=["item_id", "text"])
+        post_texts = load_items(post_texts_path, required=ITEM_TEXT_COLUMNS)
         items_sef = set(post_texts.loc[post_texts["text"].notna(), "item_id"].unique())
     else:
         items_sef = all_items
@@ -862,11 +862,8 @@ def prepare_dataset(
     seed: int = SEED,
 ) -> dict[str, Any]:
     """Run the complete offline Reddit preparation pipeline."""
-    if external_scores_path is None:
-        external_scores_path = AUXILIARY_DIR / "moderated_posts_scores.parquet"
-    if post_texts_path is None:
-        post_texts_path = AUXILIARY_DIR / "post_texts.parquet"
-
+    # ``None`` means the item table was not supplied: the SEF and BL4/BL5
+    # population filters are then not applied (recorded in the filter report).
     cleaned = load_dataset(input_path)
     density_filtered = apply_density_filter(cleaned)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -964,8 +961,10 @@ def main() -> None:
     parser.add_argument("--input", type=Path, default=INPUT_PATH)
     parser.add_argument("--output-dir", type=Path, default=OUTPUT_DIR)
     parser.add_argument("--splits-dir", type=Path, default=SPLITS_DIR)
-    parser.add_argument("--external-scores", type=Path, default=None)
-    parser.add_argument("--post-texts", type=Path, default=None)
+    parser.add_argument(
+        "--external-scores", type=Path, default=REDDIT.default_inputs().item_scores
+    )
+    parser.add_argument("--post-texts", type=Path, default=REDDIT.default_inputs().post_texts)
     parser.add_argument("--n-folds", type=int, default=_K_FOLDS)
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument(

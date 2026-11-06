@@ -21,7 +21,9 @@ from sklearn.metrics import (  # noqa: E402
 )
 from sklearn.model_selection import KFold  # noqa: E402
 
+from src.layout import REDDIT  # noqa: E402
 from src.utils.splits import discover_splits, load_split_data, split_dataset  # noqa: E402
+from src.utils.threshold_search import macro_prf_over_thresholds  # noqa: E402
 
 _SCORING_ROOT = Path(__file__).parent.parent.parent / "external/community-notes/scoring/src"
 if not _SCORING_ROOT.exists():
@@ -169,15 +171,10 @@ def calibrate_threshold(
     y_true = items_val["label"].values
     scores = items_val["i_n"].values
 
-    records = []
-    for thr in grid:
-        y_pred = np.where(scores >= thr, 1, -1)
-        p, r, f, _ = precision_recall_fscore_support(
-            y_true, y_pred, labels=[1, -1], average="macro", zero_division=0
-        )
-        records.append({"threshold": thr, "precision": p, "recall": r, "f1": f})
-
-    cal_df = pd.DataFrame(records)
+    precision, recall, f1 = macro_prf_over_thresholds(y_true, scores, grid)
+    cal_df = pd.DataFrame(
+        {"threshold": np.asarray(grid), "precision": precision, "recall": recall, "f1": f1}
+    )
     best = cal_df.loc[cal_df["f1"].idxmax()]
     best_thr = float(best["threshold"])
     print(
@@ -639,12 +636,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--votes-dir",
         type=Path,
-        default=Path("data/splits/reddit"),
+        default=REDDIT.splits,
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("results/reddit"),
+        default=REDDIT.results,
     )
     parser.add_argument("--method-name", default="cn")
     args = parser.parse_args()

@@ -12,14 +12,14 @@ import pandas as pd
 from scipy import sparse
 from sklearn.metrics import f1_score, roc_auc_score
 
+from src.layout import REDDIT  # noqa: E402
 from src.utils.net_vote_fallback import (
     add_net_vote_fallback,
     calibrate_net_vote_threshold,
 )
+from src.utils.threshold_search import best_threshold as grid_best_threshold
 
-DEFAULT_CAUSAL_FEATURES = Path(
-    "data/interim/reddit/features/causal_user_vote_features.parquet"
-)
+DEFAULT_CAUSAL_FEATURES = REDDIT.causal_features
 
 CAUSAL_GLOBAL_FEATURES = [
     "prior_n_posts",
@@ -354,9 +354,8 @@ def calibrate_thresholds_per_community(
         values = frame["score"].to_numpy(dtype=float)
         labels = frame["label"].to_numpy()
         grid = np.linspace(values.min(), values.max(), grid_size) if len(values) else np.array([0.0])
-        return float(max(grid, key=lambda threshold: f1_score(
-            labels, np.where(values >= threshold, 1, -1), average="macro"
-        )))
+        # Vectorized equivalent of max(grid, key=f1_score(..., average="macro")).
+        return grid_best_threshold(labels, values, grid, default=0.0, fixed_labels=False)[0]
 
     global_threshold = best_threshold(validation_scores)
     thresholds = {

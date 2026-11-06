@@ -10,11 +10,11 @@ import numpy as np
 import pandas as pd
 
 from src.comparison.graphs import load_predictions
+from src.layout import REDDIT
 
 plt.switch_backend("Agg")
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-OUTPUT_DIR = PROJECT_ROOT / "results" / "error_analysis"
+OUTPUT_DIR = REDDIT.root / "results" / "error_analysis"
 
 log = logging.getLogger(__name__)
 
@@ -38,17 +38,14 @@ FIXED_PROTOCOLS = {
 }
 
 
-def _prepare_output_dir() -> Path:
-    output_dir = OUTPUT_DIR.resolve()
-    expected = (PROJECT_ROOT / "results" / "error_analysis").resolve()
-    if output_dir != expected:
-        raise ValueError(f"Unexpected output directory: {output_dir}")
+def _prepare_output_dir(output_dir: Path) -> Path:
+    output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir
 
 
-def _load_items() -> pd.DataFrame:
-    path = PROJECT_ROOT / "data" / "splits" / "reddit" / "intersection" / "test_votes.parquet"
+def _load_items(splits_root: Path) -> pd.DataFrame:
+    path = splits_root / "intersection" / "test_votes.parquet"
     votes = pd.read_parquet(path)
     votes["item_id"] = votes["item_id"].astype(str)
     if (votes.groupby("item_id")["label"].nunique(dropna=False) > 1).any():
@@ -69,8 +66,8 @@ def _load_items() -> pd.DataFrame:
 
 def _load_errors(
     items: pd.DataFrame,
+    results_root: Path,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    results_root = PROJECT_ROOT / "results" / "reddit"
     predictions = {
         method: load_predictions(results_root, "intersection", method).set_index("item_id")
         for method in METHODS
@@ -121,10 +118,10 @@ def _result_row(
     }
 
 
-def _cn_crowd_alignment_results() -> pd.DataFrame:
+def _cn_crowd_alignment_results(splits_root: Path, results_root: Path) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
     for protocol, split in FIXED_PROTOCOLS.items():
-        split_root = PROJECT_ROOT / "data" / "splits" / "reddit" / split
+        split_root = splits_root / split
         test = pd.read_parquet(split_root / "test_votes.parquet")
         test["item_id"] = test["item_id"].astype(str)
         if (test.groupby("item_id")["label"].nunique(dropna=False) > 1).any():
@@ -134,13 +131,11 @@ def _cn_crowd_alignment_results() -> pd.DataFrame:
             label=("label", "first"),
             positive_vote_share=("positive_vote", "mean"),
         )
-        posts["crowd_prediction"] = np.where(
-            posts["positive_vote_share"] >= 0.5, 1, -1
-        )
+        posts["crowd_prediction"] = np.where(posts["positive_vote_share"] >= 0.5, 1, -1)
 
-        cn = pd.read_parquet(
-            PROJECT_ROOT / "results" / "reddit" / split / "cn" / "item_scores.parquet"
-        ).set_index("item_id")
+        cn = pd.read_parquet(results_root / split / "cn" / "item_scores.parquet").set_index(
+            "item_id"
+        )
         cn.index = cn.index.astype(str)
         posts = posts.loc[cn.index].copy()
         if not np.array_equal(
@@ -267,11 +262,17 @@ def _plot(
     plt.close(fig)
 
 
-def run() -> None:
-    output_dir = _prepare_output_dir()
-    items, errors, fallbacks = _load_errors(_load_items())
+def run(
+    results_root: Path = REDDIT.results,
+    splits_root: Path = REDDIT.splits,
+    output_dir: Path = OUTPUT_DIR,
+) -> None:
+    output_dir = _prepare_output_dir(output_dir)
+    items, errors, fallbacks = _load_errors(_load_items(splits_root), results_root)
     results = _key_results(items, errors)
-    results = pd.concat([results, _cn_crowd_alignment_results()], ignore_index=True)
+    results = pd.concat(
+        [results, _cn_crowd_alignment_results(splits_root, results_root)], ignore_index=True
+    )
     results["count"] = results["count"].astype("Int64")
     results["denominator"] = results["denominator"].astype("Int64")
     results.to_csv(output_dir / "failure_analysis.csv", index=False)
@@ -298,5 +299,12 @@ def run() -> None:
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--results-root", type=Path, default=REDDIT.results)
+    parser.add_argument("--splits-root", type=Path, default=REDDIT.splits)
+    parser.add_argument("--output-dir", type=Path, default=OUTPUT_DIR)
+    args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    run()
+    run(args.results_root, args.splits_root, args.output_dir)

@@ -19,8 +19,14 @@ from sklearn.metrics import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_SPLIT_DIR = REPO_ROOT / "data" / "splits" / "reddit" / "intersection"
-DEFAULT_OUTPUT_DIR = REPO_ROOT / "results" / "reddit" / "intersection" / "cn_official_compat"
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from src.layout import REDDIT  # noqa: E402
+from src.utils.threshold_search import best_threshold  # noqa: E402
+
+DEFAULT_SPLIT_DIR = REDDIT.splits / "intersection"
+DEFAULT_OUTPUT_DIR = REDDIT.results / "intersection" / "cn_official_compat"
 SCORING_ROOT = REPO_ROOT / "external" / "community-notes" / "scoring" / "src"
 
 CRH = "CRH"
@@ -719,17 +725,13 @@ def calibrate_binary_threshold(
         on="item_id",
         how="left",
     )
-    best_threshold = 0.0
-    best_f1 = -np.inf
-    for threshold in np.linspace(-2.0, 2.0, 400):
-        predictions = np.where(scores[c.internalNoteInterceptKey] >= threshold, 1, -1)
-        _, _, f1, _ = precision_recall_fscore_support(
-            scores["label"], predictions, labels=[1, -1], average="macro", zero_division=0
-        )
-        if f1 > best_f1:
-            best_f1 = float(f1)
-            best_threshold = float(threshold)
-    return best_threshold
+    threshold, _ = best_threshold(
+        scores["label"].to_numpy(),
+        scores[c.internalNoteInterceptKey].to_numpy(dtype=float),
+        np.linspace(-2.0, 2.0, 400),
+        default=0.0,
+    )
+    return threshold
 
 
 def variant_metrics(
@@ -848,7 +850,12 @@ def combine_coverage_models(
     return out
 
 
-def run(seed: int, split_dir: Path, output_dir: Path) -> dict[str, Any]:
+def run(
+    seed: int,
+    split_dir: Path,
+    output_dir: Path,
+    baseline_item_scores: Path | None = None,
+) -> dict[str, Any]:
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -955,8 +962,9 @@ def run(seed: int, split_dir: Path, output_dir: Path) -> dict[str, Any]:
 
     combined = combine_coverage_models(core_status, expanded_status, gaussian_status)
 
+    # The project's CN run for the same split sits beside this output folder.
     baseline = pd.read_parquet(
-        REPO_ROOT / "results" / "reddit" / "intersection" / "cn" / "item_scores.parquet"
+        baseline_item_scores or output_dir.parent / "cn" / "item_scores.parquet"
     )
     test_labels = test.drop_duplicates("item_id")[["item_id", "label"]].copy()
     comparison = test_labels.merge(
@@ -1131,9 +1139,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=10)
     parser.add_argument("--split-dir", type=Path, default=DEFAULT_SPLIT_DIR)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument(
+        "--baseline-item-scores",
+        type=Path,
+        default=None,
+        help="Project CN item_scores.parquet to compare against "
+        "(default: <output-dir>/../cn/item_scores.parquet).",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    run(seed=args.seed, split_dir=args.split_dir, output_dir=args.output_dir)
+    run(
+        seed=args.seed,
+        split_dir=args.split_dir,
+        output_dir=args.output_dir,
+        baseline_item_scores=args.baseline_item_scores,
+    )

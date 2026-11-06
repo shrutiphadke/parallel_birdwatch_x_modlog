@@ -18,6 +18,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[4]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+from src.layout import REDDIT  # noqa: E402
 from src.methods.team_formation_v2.bandit.pipeline import (  # noqa: E402
     build_candidate_profiles,
     split_train_items,
@@ -39,9 +40,9 @@ from src.methods.team_formation_v2.shared_features import (  # noqa: E402
     load_and_enrich_splits,
 )
 
-DEFAULT_VOTES_DIR = "data/splits/reddit/intersection_chronological"
-DEFAULT_OUT_DIR = "results/reddit/intersection_chronological/virtual_ensembles"
-DEFAULT_EMBEDDING_DIR = "cache/embeddings"
+DEFAULT_VOTES_DIR = str(REDDIT.splits / "intersection_chronological")
+DEFAULT_OUT_DIR = str(REDDIT.results / "intersection_chronological" / "virtual_ensembles")
+DEFAULT_EMBEDDING_DIR = str(REDDIT.embedding_cache)
 TEAM_NAMES = (
     "high_tenure_low_activity",
     "domain_expert_high_moderator_agreement",
@@ -51,12 +52,12 @@ CONSENSUS_FEATURES = [f"consensus_{name}" for name in TEAM_NAMES]
 
 def _stable_top(group: pd.DataFrame, score: pd.Series, team_size: int) -> pd.DataFrame:
     """Select a deterministic top-k without using current-case votes."""
-    ranked = group.assign(profile_match=score.to_numpy(dtype=float)).sort_values(
-        ["profile_match", "username"],
-        ascending=[False, True],
-        kind="stable",
-    )
-    return ranked.head(min(team_size, len(ranked)))
+    match = score.to_numpy(dtype=float)
+    # Same order as a stable sort on [profile_match desc (NaN last), username
+    # asc], without materializing the whole sorted candidate pool per case.
+    order = np.lexsort((group["username"].to_numpy(dtype=str), -match))
+    top = order[: min(team_size, len(order))]
+    return group.iloc[top].assign(profile_match=match[top])
 
 
 def select_virtual_teams(candidates: pd.DataFrame, team_size: int) -> dict[str, pd.DataFrame]:

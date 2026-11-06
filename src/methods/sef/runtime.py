@@ -18,16 +18,15 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-# Paths
-STEP1_DIR = Path("data/interim/reddit/datasets")
-SPLITS_DIR = Path("data/splits/reddit")
-FETCH_DIR = Path("data/interim/reddit/auxiliary")
-OUTPUT_DIR = Path("results/reddit")
-CACHE_DIR = Path("cache/embeddings")
-ORIGINAL_CSV = Path("data/processed/final_intersection_dataset.csv")
+from src.layout import DEFAULT_EMBEDDING_MODEL, REDDIT  # noqa: E402
+
+# Standalone CLI defaults; the pipeline always passes explicit paths.
+SPLITS_DIR = REDDIT.splits
+OUTPUT_DIR = REDDIT.results
+CACHE_DIR = REDDIT.embedding_cache
 
 # Embedding model
-EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+EMBEDDING_MODEL = DEFAULT_EMBEDDING_MODEL
 EMBEDDING_DIM = 384
 BATCH_SIZE = 64
 

@@ -18,11 +18,12 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from tqdm import tqdm
 
+from src.layout import REDDIT  # noqa: E402
 from src.utils.tabular import read_table, unix_seconds
 
-DEFAULT_INPUT_DIR = Path("data/raw/user_contributions/user_contributions")
-DEFAULT_USERS_FROM = Path("data/processed/final_intersection_dataset.csv")
-DEFAULT_OUTPUT = Path("data/interim/reddit/auxiliary/user_documents.parquet")
+DEFAULT_INPUT_DIR = REDDIT.default_inputs().user_contributions
+DEFAULT_USERS_FROM = REDDIT.default_inputs().votes
+DEFAULT_OUTPUT = REDDIT.user_documents
 DEFAULT_N_USER_DOCS = 150
 WRITE_BATCH_ROWS = 50_000
 

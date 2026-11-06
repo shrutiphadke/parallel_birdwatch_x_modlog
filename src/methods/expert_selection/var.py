@@ -17,6 +17,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+from src.layout import REDDIT  # noqa: E402
 from src.methods.expert_selection.core import (  # noqa: E402
     calculate_var_scores,
     evaluate_fold,
@@ -31,7 +32,7 @@ from src.utils.splits import discover_splits, load_vote_partitions  # noqa: E402
 
 N_FOLDS = 5
 K_VALUES = [10]
-OUTPUT_ROOT = Path("results/reddit")
+OUTPUT_ROOT = REDDIT.results
 SCALAR_METRICS = [
     "macro_f1",
     "roc_auc",
@@ -355,7 +356,7 @@ def show_prediction_examples(test_df, train_scores, k=5, n_examples=5):
 # Canonical benchmark: TRAIN estimates VAR, VAL selects strategy and K, and
 # TEST supplies final metrics. Detail exports support user-level diagnostics.
 
-VOTES_DIR_DEFAULT = Path("data/splits/reddit")
+VOTES_DIR_DEFAULT = REDDIT.splits
 VAR_MULTI_SPLIT_OUTPUT = OUTPUT_ROOT
 MIN_CAL_FALLBACK_ITEMS = 50
 

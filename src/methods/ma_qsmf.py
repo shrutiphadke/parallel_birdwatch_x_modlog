@@ -29,7 +29,9 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+from src.layout import REDDIT  # noqa: E402
 from src.utils.splits import discover_splits, load_vote_partitions  # noqa: E402
+from src.utils.threshold_search import per_class_f1_over_thresholds  # noqa: E402
 
 log = logging.getLogger(__name__)
 
@@ -471,21 +473,15 @@ def calibrate_threshold(items: pd.DataFrame) -> tuple[float, pd.DataFrame]:
     y_true = items["label"].to_numpy(dtype=int)
     scores = items["score"].to_numpy(dtype=float)
     grid = np.unique(np.concatenate([np.linspace(0.0, 1.0, 401), scores]))
-    records: list[dict[str, float]] = []
-    for threshold in grid:
-        predictions = np.where(scores >= threshold, 1, -1)
-        _, _, f1, _ = precision_recall_fscore_support(
-            y_true, predictions, labels=[1, -1], average=None, zero_division=0
-        )
-        records.append(
-            {
-                "threshold": float(threshold),
-                "macro_f1": float(np.mean(f1)),
-                "f1_approve": float(f1[0]),
-                "f1_remove": float(f1[1]),
-            }
-        )
-    calibration = pd.DataFrame(records)
+    f1_approve, f1_remove = per_class_f1_over_thresholds(y_true, scores, grid)
+    calibration = pd.DataFrame(
+        {
+            "threshold": grid.astype(float),
+            "macro_f1": np.mean(np.vstack([f1_approve, f1_remove]), axis=0),
+            "f1_approve": f1_approve,
+            "f1_remove": f1_remove,
+        }
+    )
     calibration["distance_from_half"] = (calibration["threshold"] - 0.5).abs()
     best = calibration.sort_values(
         ["macro_f1", "f1_remove", "distance_from_half", "threshold"],
@@ -843,8 +839,8 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run inductive MA-QSMF and its 2x2 ablation on prepared Reddit splits"
     )
-    parser.add_argument("--votes-dir", type=Path, default=Path("data/splits/reddit"))
-    parser.add_argument("--output-dir", type=Path, default=Path("results/reddit"))
+    parser.add_argument("--votes-dir", type=Path, default=REDDIT.splits)
+    parser.add_argument("--output-dir", type=Path, default=REDDIT.results)
     parser.add_argument("--splits", nargs="+", help="Optional subset; default: all discovered splits")
     parser.add_argument("--variants", nargs="+", choices=VARIANTS, default=list(VARIANTS))
     parser.add_argument("--lambda-y-grid", nargs="+", type=float, default=[0.01, 0.1, 1.0, 10.0])

@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 from typing import Annotated
 
+from src.layout import REDDIT  # noqa: E402
+
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 os.environ.setdefault("MPLCONFIGDIR", str((_PROJECT_ROOT / "cache" / "matplotlib").resolve()))
 
@@ -131,10 +133,10 @@ def plot_cn_confusion_matrices(results_root: Path, output_path: Path) -> None:
 
 
 def main(
-    results_root: Annotated[Path, typer.Option()] = Path("results/reddit"),
-    output_path: Annotated[Path, typer.Option()] = Path(
-        "results/report/figures/cn_base_confusion_matrix.png"
-    ),
+    results_root: Annotated[Path, typer.Option()] = REDDIT.results,
+    output_path: Annotated[Path, typer.Option()] = REDDIT.report
+    / "figures"
+    / "cn_base_confusion_matrix.png",
     log_level: Annotated[str, typer.Option()] = "INFO",
 ) -> None:
     """Generate the base-CN confusion-matrix figure used in Chapter 5."""

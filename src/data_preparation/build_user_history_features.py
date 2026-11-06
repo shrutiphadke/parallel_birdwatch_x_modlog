@@ -21,6 +21,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from src.layout import REDDIT, load_items, load_user_metadata  # noqa: E402
 from src.utils.tabular import read_table, unix_seconds
 
 try:
@@ -58,13 +59,13 @@ except ImportError:
         return json.loads(value)
 
 
-DEFAULT_INPUT_DIR = Path("data/raw/user_contributions/user_contributions")
-DEFAULT_AUTHOR_INDEX = Path("data/interim/reddit/build_state/author_index.sqlite")
-DEFAULT_FEATURE_ROOT = Path("data/interim/reddit/build_state/user_temporal_features")
-DEFAULT_VOTES = Path("data/processed/final_intersection_dataset.csv")
-DEFAULT_METADATA = Path("data/processed/user_metadata.csv")
-DEFAULT_POST_TEXTS = Path("data/interim/reddit/auxiliary/post_texts.parquet")
-DEFAULT_OUTPUT = Path("data/interim/reddit/features/causal_user_vote_features.parquet")
+DEFAULT_INPUT_DIR = REDDIT.default_inputs().user_contributions
+DEFAULT_AUTHOR_INDEX = REDDIT.author_index
+DEFAULT_FEATURE_ROOT = REDDIT.feature_root
+DEFAULT_VOTES = REDDIT.default_inputs().votes
+DEFAULT_METADATA = REDDIT.default_inputs().user_metadata
+DEFAULT_POST_TEXTS = REDDIT.default_inputs().post_texts
+DEFAULT_OUTPUT = REDDIT.causal_features
 
 FIELD_ID = "id"
 FIELD_NAME = "name"
@@ -638,9 +639,7 @@ def audit_timestamp_semantics(
         "n_rows_compared_to_post_creation": 0,
     }
     if post_texts_path.exists():
-        posts = read_table(post_texts_path)
-        if "timestamp" not in posts and "created_utc" in posts:
-            posts = posts.rename(columns={"created_utc": "timestamp"})
+        posts = load_items(post_texts_path)
         missing = {"item_id", "timestamp"} - set(posts.columns)
         if missing:
             raise ValueError(
@@ -929,11 +928,8 @@ def build_features(
 
         progress.set_postfix_str("account tenure")
         if metadata_path.exists():
-            metadata = read_table(metadata_path)
+            metadata = load_user_metadata(metadata_path)
             metadata["_user_key"] = _user_key(metadata["username"])
-            metadata["account_created_utc"] = unix_seconds(
-                metadata["account_created_utc"]
-            )
             metadata = metadata.drop_duplicates("_user_key", keep="last")
             work = work.merge(
                 metadata[["_user_key", "account_created_utc"]],

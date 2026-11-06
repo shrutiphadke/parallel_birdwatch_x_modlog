@@ -20,8 +20,12 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+from src.layout import REDDIT, load_item_scores  # noqa: E402
 from src.utils.splits import discover_splits, load_split_data  # noqa: E402
-from src.utils.tabular import read_table  # noqa: E402
+from src.utils.threshold_search import (  # noqa: E402
+    best_threshold,
+    macro_prf_over_thresholds,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,7 +38,7 @@ THRESHOLD_GRID = np.linspace(-200, 200, 800)
 ALPHA_GRID = np.linspace(1.0, 5.0, 20)
 MIN_SUB_VAL_ITEMS = 10
 N_FOLDS = 5
-REDDIT_SCORES_PATH = Path("data/interim/reddit/auxiliary/moderated_posts_scores.parquet")
+REDDIT_SCORES_PATH = REDDIT.default_inputs().item_scores
 CANONICAL_BASELINES = (
     "BL1_net_vote",
     "BL2_net_vote_alpha",
@@ -78,13 +82,14 @@ def compute_net_scores(
     alpha: float = 1.0,
 ) -> pd.DataFrame:
     """Compute net scores from the supplied data."""
+    # Vectorized counts: a per-group Python lambda dominated runtime (~80%).
     agg = (
-        votes_df.groupby("item_id")
-        .agg(
-            community=("community", "first"),
-            n_up=("vote", lambda x: (x == 1).sum()),
-            n_down=("vote", lambda x: (x == -1).sum()),
+        votes_df.assign(
+            n_up=(votes_df["vote"] == 1).astype("int64"),
+            n_down=(votes_df["vote"] == -1).astype("int64"),
         )
+        .groupby("item_id")
+        .agg(community=("community", "first"), n_up=("n_up", "sum"), n_down=("n_down", "sum"))
         .reset_index()
     )
     agg["n_votes"] = agg["n_up"] + agg["n_down"]
@@ -133,6 +138,13 @@ def make_chrono_folds(all_votes: pd.DataFrame, n_folds: int = N_FOLDS) -> List[p
 
 
 # Threshold search
+def _best_threshold(
+    y_true: np.ndarray, scores: np.ndarray, grid: np.ndarray, default: float
+) -> Tuple[float, float]:
+    """First grid threshold with the strictly best macro-F1 (loop semantics)."""
+    return best_threshold(y_true, scores, grid, default=default)
+
+
 def calibrate_global_threshold(
     scores_df: pd.DataFrame,
     val_labels: pd.DataFrame,
@@ -143,14 +155,15 @@ def calibrate_global_threshold(
     merged = merged.dropna(subset=["score"])
     y_true = merged["label"].values
     scores = merged["score"].values
-    records = []
-    for thr in grid:
-        y_pred = np.where(scores >= thr, 1, -1)
-        p, r, f, _ = precision_recall_fscore_support(
-            y_true, y_pred, labels=[1, -1], average="macro", zero_division=0
-        )
-        records.append({"threshold": thr, "precision": p, "recall": r, "f1": f})
-    cal_df = pd.DataFrame(records)
+    precision, recall, f1 = macro_prf_over_thresholds(y_true, scores, grid)
+    cal_df = pd.DataFrame(
+        {
+            "threshold": np.asarray(grid, dtype=float),
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+        }
+    )
     best = cal_df.loc[cal_df["f1"].idxmax()]
     best_thr = float(best["threshold"])
     return best_thr, cal_df
@@ -176,14 +189,7 @@ def select_alpha(
         merged_tr["score"] = merged_tr["score"].fillna(0.0)
         y_tr, s_tr = merged_tr["label"].values, merged_tr["score"].values
 
-        best_thr_tr, best_f1_tr = 0.0, -1.0
-        for thr in thr_grid:
-            y_pred = np.where(s_tr >= thr, 1, -1)
-            _, _, f, _ = precision_recall_fscore_support(
-                y_tr, y_pred, labels=[1, -1], average="macro", zero_division=0
-            )
-            if f > best_f1_tr:
-                best_f1_tr, best_thr_tr = f, thr
+        best_thr_tr, _ = _best_threshold(y_tr, s_tr, thr_grid, default=0.0)
 
         val_scores = compute_net_scores(
             pd.concat([train_df, val_df], ignore_index=True), alpha=alpha
@@ -226,15 +232,7 @@ def calibrate_per_subreddit(
             continue
         y_true = group["label"].values
         scores = group["score"].values
-        best_f1, best_thr = -1.0, global_threshold
-        for thr in grid:
-            y_pred = np.where(scores >= thr, 1, -1)
-            _, _, f, _ = precision_recall_fscore_support(
-                y_true, y_pred, labels=[1, -1], average="macro", zero_division=0
-            )
-            if f > best_f1:
-                best_f1, best_thr = f, thr
-        sub_thresholds[sub] = best_thr
+        sub_thresholds[sub], _ = _best_threshold(y_true, scores, grid, default=global_threshold)
     return sub_thresholds
 
 
@@ -507,8 +505,7 @@ def run_baseline_kfold(
 # Reddit scores
 def load_external_scores(path: Path) -> pd.DataFrame:
     """Load external scores from its configured source."""
-    df = read_table(path, columns=["item_id", "score"]).copy()
-    df["score"] = pd.to_numeric(df["score"], errors="coerce")
+    df = load_item_scores(path)
     log.info(
         "External scores loaded: %d items | %d with valid score",
         len(df),
@@ -911,9 +908,7 @@ def evaluate_splits(
         selected.intersection_update({"BL4_reddit_score", "BL5_subreddit"})
 
     external_scores_compressed = None
-    needs_external_scores = bool(
-        selected.intersection({"BL4_reddit_score", "BL5_subreddit"})
-    )
+    needs_external_scores = bool(selected.intersection({"BL4_reddit_score", "BL5_subreddit"}))
     if needs_external_scores and external_scores_path.exists():
         ext = load_external_scores(external_scores_path)
         # Preserve missing external scores through the fixed log transform.
@@ -983,12 +978,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--votes-dir",
         type=Path,
-        default=Path("data/splits/reddit"),
+        default=REDDIT.splits,
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("results/reddit"),
+        default=REDDIT.results,
     )
     parser.add_argument(
         "--external-scores",

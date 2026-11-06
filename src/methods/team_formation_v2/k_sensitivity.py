@@ -19,6 +19,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+from src.layout import REDDIT  # noqa: E402
 from src.methods.team_formation_v2.run_all import (  # noqa: E402
     CHRONOLOGICAL_SPLIT,
     DEFAULT_CAUSAL_FEATURES,
@@ -34,8 +35,8 @@ PANEL_METHODS = {
     if name != "boc_stacking"
 }
 DEFAULT_K_VALUES = (3, 5, 7, 10)
-DEFAULT_OUT_ROOT = f"results/reddit/{CHRONOLOGICAL_SPLIT}/k_sensitivity"
-DEFAULT_BOC_METRICS = f"results/reddit/{CHRONOLOGICAL_SPLIT}/boc_stacking/metrics.json"
+DEFAULT_OUT_ROOT = str(REDDIT.results / CHRONOLOGICAL_SPLIT / "k_sensitivity")
+DEFAULT_BOC_METRICS = str(REDDIT.results / CHRONOLOGICAL_SPLIT / "boc_stacking/metrics.json")
 METRIC_NAMES = ("macro_f1", "f1_neg", "roc_auc")
 
 

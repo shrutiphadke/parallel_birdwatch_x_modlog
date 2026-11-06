@@ -15,6 +15,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[4]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+from src.layout import REDDIT  # noqa: E402
 from src.methods.team_formation_v2.bandit.bandit import LinearUCB  # noqa: E402
 from src.methods.team_formation_v2.bandit.vote_simulator import (  # noqa: E402
     HierarchicalVoteSimulator,
@@ -29,9 +30,9 @@ from src.methods.team_formation_v2.shared_features import (  # noqa: E402
     load_and_enrich_splits,
 )
 
-DEFAULT_VOTES_DIR = "data/splits/reddit/intersection_chronological"
-DEFAULT_OUT_DIR = "results/reddit/intersection_chronological/bandit"
-DEFAULT_EMBEDDING_DIR = "cache/embeddings"
+DEFAULT_VOTES_DIR = str(REDDIT.splits / "intersection_chronological")
+DEFAULT_OUT_DIR = str(REDDIT.results / "intersection_chronological" / "bandit")
+DEFAULT_EMBEDDING_DIR = str(REDDIT.embedding_cache)
 
 
 def split_train_items(

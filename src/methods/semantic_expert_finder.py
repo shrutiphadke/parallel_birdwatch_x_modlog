@@ -10,6 +10,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+from src.layout import REDDIT  # noqa: E402
 from src.methods.sef import runtime  # noqa: E402
 from src.methods.sef.data import (  # noqa: E402
     _get_model,
@@ -18,6 +19,7 @@ from src.methods.sef.data import (  # noqa: E402
     build_temporal_user_profiles,
     collect_temporal_profile_requests,
     load_post_texts,
+    load_prepared_cache,
     load_user_documents,
     load_votes,
 )
@@ -44,6 +46,16 @@ from src.methods.team_formation_v2.shared_features import (  # noqa: E402
 )
 
 # ENTRY POINT
+
+
+def semantic_input_hashes(post_texts: Path, user_documents: Path | None) -> dict:
+    """Identify the text inputs a prepared SEF cache was built from."""
+    from src.utils.hashing import sha256_file
+
+    return {
+        "post_texts": sha256_file(post_texts),
+        "user_documents": sha256_file(user_documents) if user_documents else None,
+    }
 
 
 def main() -> None:
@@ -91,12 +103,22 @@ def main() -> None:
     parser.add_argument(
         "--post-texts",
         type=Path,
-        default=runtime.FETCH_DIR / "post_texts.parquet",
+        default=REDDIT.default_inputs().post_texts,
     )
     parser.add_argument(
         "--user-documents",
         type=Path,
-        default=runtime.FETCH_DIR / "user_documents.parquet",
+        default=REDDIT.user_documents,
+    )
+    parser.add_argument(
+        "--prepared-cache",
+        action="store_true",
+        help="Load embeddings/profiles written by `prepare sef-cache` instead of building them.",
+    )
+    parser.add_argument(
+        "--split-label",
+        default=None,
+        help="Canonical split name when --votes-dir is one split (keeps seeds and output paths).",
     )
     parser.add_argument("--embedding-dir", type=Path, default=CACHE_DIR)
     parser.add_argument(
@@ -152,21 +174,33 @@ def main() -> None:
     runtime.random_seed = args.random_seed
     runtime.causal_feature_table = load_causal_features(args.causal_features)
 
-    base_vote_df = load_votes(args.input_csv)
-    enriched_vote_df = attach_causal_features(base_vote_df, runtime.causal_feature_table)
-    post_texts = load_post_texts(args.post_texts)
-    user_docs = load_user_documents(args.user_documents)
-    profile_requests = collect_temporal_profile_requests(base_vote_df, args.votes_dir)
-
     model = args.embedding_model or _get_model()
-    post_emb, post_id_list = build_post_embeddings(post_texts, embed_dir, model)
-    user_profiles = build_temporal_user_profiles(user_docs, profile_requests, embed_dir, model)
-    log.info(
-        "User profiles: %d / %d (%.1f%%)",
-        user_profiles.n_users_with_history,
-        base_vote_df["username"].nunique(),
-        100 * user_profiles.n_users_with_history / max(base_vote_df["username"].nunique(), 1),
-    )
+    enriched_vote_df = None
+    if args.prepared_cache:
+        if "kfold" in tasks_to_run:
+            parser.error("--prepared-cache supports the canonical split task only")
+        # The prepare stage already encoded every text and materialized the
+        # union of profile requests, so this process only memory-maps them.
+        post_emb, post_id_list, user_profiles = load_prepared_cache(
+            embed_dir,
+            model=str(model),
+            input_hashes=semantic_input_hashes(args.post_texts, args.user_documents),
+        )
+    else:
+        base_vote_df = load_votes(args.input_csv)
+        if "kfold" in tasks_to_run:
+            enriched_vote_df = attach_causal_features(base_vote_df, runtime.causal_feature_table)
+        post_texts = load_post_texts(args.post_texts)
+        user_docs = load_user_documents(args.user_documents)
+        profile_requests = collect_temporal_profile_requests(base_vote_df, args.votes_dir)
+        post_emb, post_id_list = build_post_embeddings(post_texts, embed_dir, model)
+        user_profiles = build_temporal_user_profiles(user_docs, profile_requests, embed_dir, model)
+        log.info(
+            "User profiles: %d / %d (%.1f%%)",
+            user_profiles.n_users_with_history,
+            base_vote_df["username"].nunique(),
+            100 * user_profiles.n_users_with_history / max(base_vote_df["username"].nunique(), 1),
+        )
 
     faiss_index = build_faiss_index(post_emb, announce=True)
 
@@ -209,6 +243,7 @@ def main() -> None:
             do_grid_search=not args.no_grid_search,
             reuse_hyperparams=args.reuse_hyperparams,
             n_workers=args.n_workers,
+            split_label=args.split_label,
         )
 
     log.info("Processing complete.")

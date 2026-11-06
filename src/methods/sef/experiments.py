@@ -569,13 +569,22 @@ def evaluate_splits(
     do_grid_search: bool = True,
     reuse_hyperparams: bool = False,
     n_workers: int = 1,
+    split_label: str | None = None,
 ) -> Dict[str, Dict]:
-    """Evaluate splits and return its metrics."""
+    """Evaluate splits and return its metrics.
+
+    ``split_label`` names a single split passed directly as ``votes_dir`` so a
+    per-split process keeps the canonical name used for seeds and output paths.
+    """
     global post_ids_ordered
     post_ids_ordered = post_id_list
     post_id2idx = {pid: i for i, pid in enumerate(post_id_list)}
 
     splits = discover_splits(votes_dir)
+    if split_label is not None:
+        if len(splits) != 1:
+            raise ValueError("--split-label requires --votes-dir to be exactly one split")
+        splits = {split_label: next(iter(splits.values()))}
     if not splits:
         log.warning(
             "No prepared splits found under %s",

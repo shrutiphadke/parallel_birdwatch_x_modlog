@@ -10,6 +10,8 @@ import pandas as pd
 from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_score
 from sklearn.preprocessing import StandardScaler
 
+from src.utils.threshold_search import macro_prf_over_thresholds
+
 from . import runtime
 from .data import TemporalUserProfiles
 from .features import _compute_weighted_votes, compute_expert_weights
@@ -115,11 +117,14 @@ def grid_search_hyperparams(
                 continue
             y_true = np.array([labels[iid] for iid in common])
             y_score = np.array([wv[iid] for iid in common])
-            best_f1 = -1.0
-            for thr in np.linspace(y_score.min(), y_score.max(), 50):
-                y_pred = np.where(y_score >= thr, 1, -1)
-                f1 = f1_score(y_true, y_pred, average="macro", zero_division=0)
-                best_f1 = max(best_f1, f1)
+            # Vectorized: max macro-F1 (labels present in y_true/y_pred) over the grid.
+            _, _, grid_f1 = macro_prf_over_thresholds(
+                y_true,
+                y_score,
+                np.linspace(y_score.min(), y_score.max(), 50),
+                fixed_labels=False,
+            )
+            best_f1 = max(-1.0, float(grid_f1.max()))
 
             if best_f1 > best["f1"]:
                 best = {

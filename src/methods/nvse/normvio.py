@@ -19,8 +19,8 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+from src.layout import ITEM_NVSE_COLUMNS, REDDIT, load_items  # noqa: E402
 from src.utils.splits import discover_splits  # noqa: E402
-from src.utils.tabular import read_table  # noqa: E402
 
 # Constants
 BERT_TYPE = "DeepPavlov/bert-base-cased-conversational"
@@ -170,8 +170,13 @@ def score_texts(
     tokenizer: BertTokenizer,
     device: torch.device,
     batch_size: int = 32,
+    encoded_texts: List[List[int]] | None = None,
 ) -> np.ndarray:
-    """Predict violation probabilities for a batch of texts."""
+    """Predict violation probabilities for a batch of texts.
+
+    ``encoded_texts`` (``encode_text`` applied to each text) lets callers that
+    score the same texts with several models tokenize them only once.
+    """
     probs = np.full(len(texts), np.nan)
     valid_idx = [i for i, t in enumerate(texts) if t.strip()]
 
@@ -181,7 +186,11 @@ def score_texts(
             print(f"Inference: {len(valid_idx):,} texts | {n_batches} batches", flush=True)
         chunk = valid_idx[start : start + batch_size]
         batch_texts = [texts[i] for i in chunk]
-        encoded = [encode_text(t, tokenizer) for t in batch_texts]
+        encoded = (
+            [encoded_texts[i] for i in chunk]
+            if encoded_texts is not None
+            else [encode_text(t, tokenizer) for t in batch_texts]
+        )
 
         nonempty = [(li, e) for li, e in enumerate(encoded) if e]
         if not nonempty:
@@ -216,6 +225,8 @@ def run_inference_all_categories(
     scores: Dict[str, np.ndarray] = {}
     model_source = model_source or resolve_bert_source()
     print(f"BERT source: {model_source}")
+    # Every category model shares the tokenizer: tokenize once, not per model.
+    encoded_texts = [encode_text(text, tokenizer) if text.strip() else [] for text in texts]
     for cat in tqdm(CATEGORIES, desc="NormVio categories"):
         model_dir = models_dir / cat
         if not model_dir.exists():
@@ -224,7 +235,9 @@ def run_inference_all_categories(
             continue
         try:
             predictor = load_model(model_dir, device, model_source=model_source)
-            probs = score_texts(texts, predictor, tokenizer, device, batch_size)
+            probs = score_texts(
+                texts, predictor, tokenizer, device, batch_size, encoded_texts=encoded_texts
+            )
             scores[cat] = probs
         except Exception as exc:
             import traceback
@@ -306,13 +319,12 @@ def _build_post_text(row: pd.Series) -> str:
     return f"r/{subreddit} {content}" if content else ""
 
 
-POST_TEXTS_PATH = Path("data/interim/reddit/auxiliary/post_texts.parquet")
-DEFAULT_VIOLATION_SCORES = Path("cache/nvse/post_violation_scores.parquet")
+POST_TEXTS_PATH = REDDIT.default_inputs().post_texts
+DEFAULT_VIOLATION_SCORES = REDDIT.nvse_scores
 
 
 def score_violations(
     votes_dir: Path,
-    docs_path: Path,
     models_dir: Path,
     out_path: Path,
     tokenizer: BertTokenizer,
@@ -326,39 +338,13 @@ def score_violations(
     votes = load_votes(votes_dir)
     items = votes.drop_duplicates("item_id")[["item_id", "community"]].copy()
 
-    # Use canonical post texts, then the low-coverage legacy document fallback.
-    if post_texts_path.exists():
-        post_texts = read_table(post_texts_path)
-        required = {"item_id", "title", "selftext"}
-        missing = required - set(post_texts.columns)
-        if missing:
-            raise ValueError(
-                f"{post_texts_path} is missing canonical post-text columns: {sorted(missing)}"
-            )
-        post_texts = post_texts[["item_id", "title", "selftext"]]
-        posts = items.merge(post_texts, on="item_id", how="left")
-        n_missing = posts["title"].isna().sum()
-        source = post_texts_path
-    else:
-        print(
-            f"Post text fallback: {post_texts_path} missing; "
-            "run `python -m src.data_preparation.fetch_reddit_auxiliary_data "
-            "--section post-texts`"
-        )
-        docs = pd.read_parquet(docs_path)
-        if "item_id" not in docs and "thing_id" in docs:
-            docs = docs.rename(columns={"thing_id": "item_id"})
-        required = {"source", "item_id", "text"}
-        missing = required - set(docs.columns)
-        if missing:
-            raise ValueError(f"{docs_path} is missing fallback columns: {sorted(missing)}")
-        docs = docs[docs["source"] == "post"].copy()
-        bare = ~docs["item_id"].astype(str).str.startswith("t3_")
-        docs.loc[bare, "item_id"] = "t3_" + docs.loc[bare, "item_id"].astype(str)
-        docs = docs.drop_duplicates("item_id")
-        posts = items.merge(docs[["item_id", "text"]], on="item_id", how="left")
-        n_missing = posts["text"].isna().sum()
-        source = docs_path
+    # Item tables provide title/selftext (derived from ``text`` when absent).
+    post_texts = load_items(post_texts_path, required=ITEM_NVSE_COLUMNS)
+    posts = items.merge(
+        post_texts[list(ITEM_NVSE_COLUMNS)].drop_duplicates("item_id"), on="item_id", how="left"
+    )
+    n_missing = posts["title"].isna().sum()
+    source = post_texts_path
 
     print(f"Post texts: {len(posts):,} | missing={n_missing:,} | source={source}")
 

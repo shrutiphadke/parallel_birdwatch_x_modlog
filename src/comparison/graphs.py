@@ -22,8 +22,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
-from src.utils.splits import discover_splits, load_vote_partitions  # noqa: E402
 import typer  # noqa: E402
+
+from src.layout import REDDIT  # noqa: E402
+from src.utils.splits import discover_splits, load_vote_partitions  # noqa: E402
 
 log = logging.getLogger(__name__)
 
@@ -1202,9 +1204,9 @@ def main(
             ),
         ),
     ] = None,
-    results_root: Annotated[Path, typer.Option()] = Path("results/reddit"),
-    splits_root: Annotated[Path, typer.Option()] = Path("data/splits/reddit"),
-    output_dir: Annotated[Path, typer.Option()] = Path("results/report"),
+    results_root: Annotated[Path, typer.Option()] = REDDIT.results,
+    splits_root: Annotated[Path, typer.Option()] = REDDIT.splits,
+    output_dir: Annotated[Path, typer.Option()] = REDDIT.report,
     strict_audit: Annotated[bool, typer.Option()] = False,
     log_level: Annotated[str, typer.Option()] = "INFO",
     k_fold_only: Annotated[bool, typer.Option("--k-fold-only")] = False,

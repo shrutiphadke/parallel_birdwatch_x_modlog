@@ -14,6 +14,8 @@ from sklearn.metrics import f1_score
 from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import StandardScaler
 
+from src.utils.threshold_search import macro_prf_over_thresholds
+
 from . import runtime
 from .runtime import (
     META_OOF_FOLDS,
@@ -24,6 +26,7 @@ from .runtime import (
 
 try:
     from xgboost import XGBClassifier
+
     HAS_XGBOOST = True
 except ImportError:
     HAS_XGBOOST = False
@@ -406,9 +409,9 @@ def calibrate_probability_threshold(
 
     candidates = np.unique(np.concatenate([np.linspace(0.01, 0.99, 199), y_score]))
     best_thr, best_f1 = 0.5, -1.0
-    for thr in candidates:
-        y_pred = np.where(y_score >= thr, 1, -1)
-        f1 = f1_score(y_true, y_pred, average="macro", zero_division=0)
+    # Scores for every candidate at once; the tie-break loop below is unchanged.
+    _, _, candidate_f1 = macro_prf_over_thresholds(y_true, y_score, candidates, fixed_labels=False)
+    for thr, f1 in zip(candidates, candidate_f1.tolist()):
         if f1 > best_f1 or (
             np.isclose(f1, best_f1) and abs(float(thr) - 0.5) < abs(best_thr - 0.5)
         ):

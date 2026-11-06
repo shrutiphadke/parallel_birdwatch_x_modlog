@@ -6,14 +6,16 @@ import argparse
 from pathlib import Path
 
 import pandas as pd
+
 from src.data_preparation.prepare_reddit_data import (
     _CHRONOLOGICAL_INITIAL_TRAIN_FRAC,
     _K_FOLDS,
     SEED,
     write_kfold_splits,
 )
+from src.layout import REDDIT  # noqa: E402
 
-DEFAULT_SPLITS_ROOT = Path("data/splits/reddit")
+DEFAULT_SPLITS_ROOT = REDDIT.splits
 
 
 def _load_recomposed_split(split_dir: Path) -> pd.DataFrame:

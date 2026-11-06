@@ -1,4 +1,4 @@
-"""Fetch resumable Reddit text, user documents, and scores from Arctic Shift."""
+"""Fetch resumable Reddit items (texts + scores) and user documents from Arctic Shift."""
 
 from __future__ import annotations
 
@@ -15,11 +15,13 @@ import pandas as pd
 import requests
 from tqdm import tqdm
 
+from src.layout import REDDIT
 from src.utils.tabular import read_table, unix_seconds
 
-INPUT_CSV = Path("data/processed/final_intersection_dataset.csv")
-OUTPUT_DIR = Path("data/interim/reddit/auxiliary")
-FILTERED_VOTES = Path("data/interim/reddit/datasets/filtered_votes.parquet")
+INPUT_CSV = REDDIT.default_inputs().votes
+OUTPUT_DIR = REDDIT.auxiliary
+# Former section names, all served by the single ``items`` pass now.
+LEGACY_SECTIONS = {"post-texts": "items", "reddit-scores": "items", "moderated-items": "items"}
 ARCTIC_SHIFT_BASE = "https://arctic-shift.photon-reddit.com"
 
 API_TIMEOUT_SEC = 30
@@ -234,59 +236,6 @@ def _normalize_auxiliary_columns(frame: pd.DataFrame) -> pd.DataFrame:
     return frame
 
 
-def _post_text_row(item: Dict, fallback_id: Optional[str] = None) -> Dict:
-    return {
-        "item_id": _canonical_post_id(item, fallback_id),
-        "subreddit": item.get("subreddit"),
-        "author": item.get("author"),
-        "timestamp": _numeric(item.get("created_utc")),
-        "title": _safe_text(item.get("title")),
-        "selftext": _safe_text(item.get("selftext")),
-        "text": _combine_post_text(item),
-        "score": _numeric(item.get("score")),
-        "url": item.get("url"),
-        "is_self": item.get("is_self"),
-    }
-
-
-def fetch_post_texts(
-    client: ArcticShiftClient,
-    input_csv: Path,
-    output_dir: Path,
-    checkpoint_chunks: int = 200,
-) -> dict:
-    """Fetch and checkpoint canonical post text rows for every vote item."""
-    output_path = output_dir / "post_texts.parquet"
-    all_ids = _load_ids(input_csv, "item_id")
-    done = (
-        set(pd.read_parquet(output_path, columns=["item_id"])["item_id"].dropna())
-        if output_path.exists()
-        else set()
-    )
-    todo = [item_id for item_id in all_ids if item_id not in done]
-    rows: List[Dict] = []
-    chunks = list(_chunk(todo, POST_CHUNK_SIZE))
-    for chunk_index, item_chunk in enumerate(tqdm(chunks, desc="Post texts")):
-        items = client.fetch_posts_by_ids(item_chunk)
-        by_bare_id = {_strip_prefix(_canonical_post_id(item) or ""): item for item in items}
-        for item_id in item_chunk:
-            item = by_bare_id.get(_strip_prefix(item_id))
-            rows.append(
-                _post_text_row(item, item_id) if item is not None else _post_text_row({}, item_id)
-            )
-        if rows and (chunk_index + 1) % checkpoint_chunks == 0:
-            _merge_checkpoint(output_path, rows, ["item_id"])
-            rows.clear()
-    frame = _merge_checkpoint(output_path, rows, ["item_id"])
-    return {
-        "section": "post-texts",
-        "output": output_path.as_posix(),
-        "n_requested": len(all_ids),
-        "n_rows": len(frame),
-        "n_with_text": int(frame["text"].notna().sum()) if not frame.empty else 0,
-    }
-
-
 def _infer_time_window(input_csv: Path) -> Tuple[Optional[str], Optional[str]]:
     timestamps = read_table(input_csv, columns=["timestamp"])["timestamp"]
     numeric = unix_seconds(timestamps)
@@ -416,15 +365,11 @@ def fetch_user_documents(
         document_rows.extend(documents)
         summary_rows.append(summary)
         if (user_index + 1) % checkpoint_users == 0:
-            _merge_checkpoint(
-                documents_path, document_rows, ["username", "source", "item_id"]
-            )
+            _merge_checkpoint(documents_path, document_rows, ["username", "source", "item_id"])
             _merge_checkpoint(summary_path, summary_rows, ["username"])
             document_rows.clear()
             summary_rows.clear()
-    documents = _merge_checkpoint(
-        documents_path, document_rows, ["username", "source", "item_id"]
-    )
+    documents = _merge_checkpoint(documents_path, document_rows, ["username", "source", "item_id"])
     summaries = _merge_checkpoint(summary_path, summary_rows, ["username"])
     return {
         "section": "user-documents",
@@ -439,76 +384,73 @@ def fetch_user_documents(
     }
 
 
-def _score_row(item: Dict, fallback_id: Optional[str] = None) -> Dict:
+def _item_row(item: Dict, fallback_id: Optional[str] = None) -> Dict:
+    """One canonical per-item row: texts and Reddit score from a single response."""
     title = _safe_text(item.get("title"))
     body = _safe_text(item.get("selftext"))
     return {
         "item_id": _canonical_post_id(item, fallback_id),
         "author": item.get("author"),
         "subreddit": item.get("subreddit"),
+        "timestamp": _numeric(item.get("created_utc")),
         "title": title,
         "selftext": body,
-        "full_text": f"{title}\n\n{body}" if title and body else title or body,
-        "url": item.get("url"),
-        "domain": item.get("domain"),
+        "text": _combine_post_text(item),
         "score": _numeric(item.get("score")),
         "upvote_ratio": _numeric(item.get("upvote_ratio")),
         "num_comments": _numeric(item.get("num_comments")),
-        "timestamp": _numeric(item.get("created_utc")),
+        "url": item.get("url"),
+        "domain": item.get("domain"),
+        "is_self": item.get("is_self"),
         "removed_by_category": item.get("removed_by_category"),
         "removal_reason": item.get("removal_reason"),
         "banned_by": item.get("banned_by"),
         "locked": item.get("locked", False),
         "over_18": item.get("over_18", False),
-        "is_self": item.get("is_self"),
         "link_flair_text": item.get("link_flair_text"),
         "author_flair_text": item.get("author_flair_text"),
         "permalink": item.get("permalink"),
     }
 
 
-def fetch_reddit_scores(
+def fetch_items(
     client: ArcticShiftClient,
     votes_path: Path,
     output_dir: Path,
     checkpoint_chunks: int = 200,
 ) -> dict:
-    """Fetch Reddit score metadata for each unique moderated post."""
-    if not votes_path.exists():
-        raise FileNotFoundError(votes_path)
-    votes = read_table(votes_path, columns=["item_id", "community", "label"])
-    moderated = votes.drop_duplicates("item_id").reset_index(drop=True)
-    output_path = output_dir / "moderated_posts_scores.parquet"
-    existing = pd.read_parquet(output_path) if output_path.exists() else pd.DataFrame()
-    done = set(existing["item_id"].dropna()) if not existing.empty else set()
-    todo = moderated[~moderated["item_id"].isin(done)].copy()
+    """Fetch every voted item once into ``items.parquet`` (texts + score).
+
+    This replaces the former separate post-text and score passes, which
+    requested every post from Arctic Shift twice.  Items Arctic Shift does not
+    return still get a row (with null fields) so resumed runs skip them.
+    """
+    output_path = output_dir / "items.parquet"
+    all_ids = _load_ids(votes_path, "item_id")
+    done = (
+        set(pd.read_parquet(output_path, columns=["item_id"])["item_id"].dropna())
+        if output_path.exists()
+        else set()
+    )
+    todo = [item_id for item_id in all_ids if item_id not in done]
     rows: List[Dict] = []
-    chunks = list(_chunk(todo["item_id"].tolist(), SCORE_CHUNK_SIZE))
-    for chunk_index, item_chunk in enumerate(tqdm(chunks, desc="Reddit scores")):
+    chunks = list(_chunk(todo, POST_CHUNK_SIZE))
+    for chunk_index, item_chunk in enumerate(tqdm(chunks, desc="Items")):
         items = client.fetch_posts_by_ids(item_chunk)
         by_bare_id = {_strip_prefix(_canonical_post_id(item) or ""): item for item in items}
         for item_id in item_chunk:
-            item = by_bare_id.get(_strip_prefix(item_id))
-            rows.append(_score_row(item or {}, item_id))
+            rows.append(_item_row(by_bare_id.get(_strip_prefix(item_id)) or {}, item_id))
         if rows and (chunk_index + 1) % checkpoint_chunks == 0:
-            fetched = pd.DataFrame(rows)
-            fetched = todo[["item_id", "community", "label"]].merge(
-                fetched, on="item_id", how="inner"
-            )
-            _merge_checkpoint(output_path, fetched.to_dict("records"), ["item_id"])
+            _merge_checkpoint(output_path, rows, ["item_id"])
             rows.clear()
-    if rows:
-        fetched = pd.DataFrame(rows)
-        fetched = todo[["item_id", "community", "label"]].merge(fetched, on="item_id", how="inner")
-        result = _merge_checkpoint(output_path, fetched.to_dict("records"), ["item_id"])
-    else:
-        result = pd.read_parquet(output_path) if output_path.exists() else pd.DataFrame()
+    frame = _merge_checkpoint(output_path, rows, ["item_id"])
     return {
-        "section": "reddit-scores",
+        "section": "items",
         "output": output_path.as_posix(),
-        "n_requested": len(moderated),
-        "n_rows": len(result),
-        "n_with_score": int(result["score"].notna().sum()) if not result.empty else 0,
+        "n_requested": len(all_ids),
+        "n_rows": len(frame),
+        "n_with_text": int(frame["text"].notna().sum()) if not frame.empty else 0,
+        "n_with_score": int(frame["score"].notna().sum()) if not frame.empty else 0,
     }
 
 
@@ -538,17 +480,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--section",
-        choices=[
-            "post-texts",
-            "user-documents",
-            "reddit-scores",
-            "moderated-items",
-            "all",
-        ],
-        default="all",
+        choices=["items", "user-documents", "all", *LEGACY_SECTIONS],
+        default="items",
     )
     parser.add_argument("--input-csv", type=Path, default=INPUT_CSV)
-    parser.add_argument("--votes", type=Path, default=FILTERED_VOTES)
     parser.add_argument("--output-dir", type=Path, default=OUTPUT_DIR)
     parser.add_argument(
         "--user-documents-output",
@@ -570,9 +505,10 @@ def main() -> None:
 
     client = ArcticShiftClient(base_url=args.base_url, sleep_seconds=args.request_sleep)
     reports = []
-    if args.section in {"post-texts", "moderated-items", "all"}:
-        reports.append(fetch_post_texts(client, args.input_csv, args.output_dir))
-    if args.section in {"user-documents", "all"}:
+    section = LEGACY_SECTIONS.get(args.section, args.section)
+    if section in {"items", "all"}:
+        reports.append(fetch_items(client, args.input_csv, args.output_dir))
+    if section in {"user-documents", "all"}:
         reports.append(
             fetch_user_documents(
                 client,
@@ -585,8 +521,6 @@ def main() -> None:
                 missing_only=args.missing_user_documents_only,
             )
         )
-    if args.section in {"reddit-scores", "moderated-items", "all"}:
-        reports.append(fetch_reddit_scores(client, args.votes, args.output_dir))
     _write_manifest(args.output_dir, args.section, reports, client)
     for report in reports:
         log.info("%s", report)

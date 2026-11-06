@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -14,10 +13,13 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from src import layout
+from src.layout import DatasetLayout, InputBundle
+from src.utils.hashing import sha256_file
 from src.utils.splits import discover_splits
 from src.utils.tabular import read_table, table_columns, unix_seconds
 
-VOTE_COLUMNS = {"username", "community", "item_id", "timestamp", "vote", "label"}
+VOTE_COLUMNS = set(layout.VOTE_COLUMNS)
 CAUSAL_COLUMNS = {
     "username",
     "item_id",
@@ -36,17 +38,9 @@ CAUSAL_COLUMNS = {
     "prior_n_interaction_partners_in_sub",
     "prior_total_interactions_in_sub",
 }
-NORMVIO_CATEGORIES = (
-    "spam",
-    "meta-rules",
-    "content",
-    "harassment",
-    "hatespeech",
-    "format",
-    "off-topic",
-    "trolling",
-    "incivility",
-)
+NORMVIO_CATEGORIES = layout.NORMVIO_CATEGORIES
+# Baselines that read per-item Reddit scores; BL1-BL3 need only votes.
+SCORE_BASELINES = ("BL4_reddit_score", "BL5_subreddit")
 NVSE_COLUMNS = {
     "item_id",
     "community",
@@ -114,10 +108,9 @@ def _path(project_root: Path, value: Any, *, field: str) -> Path | None:
     return path if path.is_absolute() else project_root / path
 
 
-def _required_path(project_root: Path, value: Any, *, field: str) -> Path:
-    path = _path(project_root, value, field=field)
+def _required_votes(path: Path | None) -> Path:
     if path is None:
-        raise ValueError(f"{field} is required")
+        raise ValueError("inputs.votes is required (or inputs.directory containing votes.*)")
     return path
 
 
@@ -212,7 +205,9 @@ def load_reproduction_config(
     _check_keys(
         inputs,
         {
+            "directory",
             "votes",
+            "items",
             "post_texts",
             "user_documents",
             "user_contributions",
@@ -251,14 +246,17 @@ def load_reproduction_config(
         "run",
     )
 
-    interim = _required_path(
-        project_root,
-        outputs.get("interim", f"data/interim/{dataset}"),
-        field="outputs.interim",
-    )
-    cache = _required_path(
-        project_root, outputs.get("cache", f"cache/{dataset}"), field="outputs.cache"
-    )
+    paths = DatasetLayout(dataset, project_root)
+    directory = _path(project_root, inputs.get("directory"), field="inputs.directory")
+    bundle = InputBundle.from_directory(directory) if directory else InputBundle()
+    items = _path(project_root, inputs.get("items"), field="inputs.items")
+
+    def input_path(key: str, fallback: Path | None) -> Path | None:
+        explicit = _path(project_root, inputs.get(key), field=f"inputs.{key}")
+        return explicit if explicit is not None else fallback
+
+    interim = _path(project_root, outputs.get("interim"), field="outputs.interim") or paths.interim
+    cache = _path(project_root, outputs.get("cache"), field="outputs.cache") or paths.cache
     raw_methods = run.get("methods", ["all"])
     if (
         not isinstance(raw_methods, list)
@@ -288,8 +286,8 @@ def load_reproduction_config(
         or not all(isinstance(value, str) for value in sections)
     ):
         raise ValueError("run.graph_sections must be a non-empty JSON array of strings")
-    normvio_bert = inputs.get("normvio_bert", "DeepPavlov/bert-base-cased-conversational")
-    embedding_model = inputs.get("embedding_model", "sentence-transformers/all-MiniLM-L6-v2")
+    normvio_bert = inputs.get("normvio_bert", layout.DEFAULT_NORMVIO_BERT)
+    embedding_model = inputs.get("embedding_model", layout.DEFAULT_EMBEDDING_MODEL)
     if not isinstance(normvio_bert, str) or not normvio_bert.strip():
         raise ValueError("inputs.normvio_bert must be a non-empty model id/path string")
     if not isinstance(embedding_model, str) or not embedding_model.strip():
@@ -304,39 +302,22 @@ def load_reproduction_config(
     return ReproductionConfig(
         source=source,
         dataset=dataset,
-        votes=_required_path(project_root, inputs.get("votes"), field="inputs.votes"),
-        post_texts=_path(project_root, inputs.get("post_texts"), field="inputs.post_texts"),
-        user_documents=_path(
-            project_root, inputs.get("user_documents"), field="inputs.user_documents"
-        ),
-        user_contributions=_path(
-            project_root, inputs.get("user_contributions"), field="inputs.user_contributions"
-        ),
-        user_metadata=_path(
-            project_root, inputs.get("user_metadata"), field="inputs.user_metadata"
-        ),
-        external_scores=_path(
-            project_root, inputs.get("external_scores"), field="inputs.external_scores"
-        ),
-        normvio_models=_path(
-            project_root, inputs.get("normvio_models"), field="inputs.normvio_models"
-        ),
+        votes=_required_votes(input_path("votes", bundle.votes)),
+        post_texts=input_path("post_texts", items or bundle.post_texts),
+        user_documents=input_path("user_documents", bundle.user_documents),
+        user_contributions=input_path("user_contributions", bundle.user_contributions),
+        user_metadata=input_path("user_metadata", bundle.user_metadata),
+        external_scores=input_path("external_scores", items or bundle.item_scores),
+        normvio_models=input_path("normvio_models", paths.normvio_models),
         normvio_bert=normvio_bert,
         embedding_model=embedding_model,
         interim=interim,
-        splits=_required_path(
-            project_root, outputs.get("splits", f"data/splits/{dataset}"), field="outputs.splits"
-        ),
-        results=_required_path(
-            project_root, outputs.get("results", f"results/{dataset}"), field="outputs.results"
-        ),
-        report=_required_path(
-            project_root,
-            outputs.get("report", f"results/report/{dataset}"),
-            field="outputs.report",
-        ),
+        splits=_path(project_root, outputs.get("splits"), field="outputs.splits") or paths.splits,
+        results=_path(project_root, outputs.get("results"), field="outputs.results")
+        or paths.results,
+        report=_path(project_root, outputs.get("report"), field="outputs.report") or paths.report,
         cache=cache,
-        causal_features=causal or interim / "features" / "causal_user_vote_features.parquet",
+        causal_features=causal or interim / "features" / paths.causal_features.name,
         nvse_scores=nvse or cache / "nvse" / "post_violation_scores.parquet",
         embedding_cache=embedding or cache / "embeddings",
         causal_features_are_precomputed=causal is not None,
@@ -366,12 +347,14 @@ def _validate_table(
     label: str,
     errors: list[str],
     aliases: dict[str, set[str]] | None = None,
+    *,
+    item_table: bool = False,
 ) -> None:
     if path is None or not path.is_file():
         errors.append(f"{label}: missing file ({path})")
         return
     try:
-        columns = set(table_columns(path))
+        columns = layout.item_table_columns(path) if item_table else set(table_columns(path))
     except Exception as exc:
         errors.append(f"{label}: cannot read {path}: {exc}")
         return
@@ -458,14 +441,6 @@ def _validate_contribution_jsonl(input_dir: Path, errors: list[str]) -> None:
         errors.append(f"No non-empty contribution JSONL record found in {input_dir}")
 
 
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def validate_reproduction_config(
     config: ReproductionConfig,
     project_root: Path,
@@ -522,7 +497,7 @@ def validate_reproduction_config(
                     )
             recorded_hash = dataset_manifest.get("input_sha256")
             if recorded_hash:
-                if _sha256_file(config.votes) != recorded_hash:
+                if sha256_file(config.votes) != recorded_hash:
                     errors.append(
                         f"Configured votes changed after splits were prepared: {config.votes}; "
                         "set run.force=true to rebuild"
@@ -540,7 +515,7 @@ def validate_reproduction_config(
                 recorded_optional = optional_manifest.get(key, {})
                 recorded_optional_hash = recorded_optional.get("sha256")
                 if current_path is not None and current_path.is_file() and recorded_optional_hash:
-                    if _sha256_file(current_path) != recorded_optional_hash:
+                    if sha256_file(current_path) != recorded_optional_hash:
                         errors.append(
                             f"{key} changed after the intersection split was prepared: "
                             f"{current_path}; set run.force=true to rebuild"
@@ -591,15 +566,22 @@ def validate_reproduction_config(
         and config.prepare_nvse_scores
         and (config.force or not config.nvse_scores.is_file())
     )
+    embeddings_ready = (config.embedding_cache / "post_embeddings.npy").is_file() and (
+        config.embedding_cache / "post_ids.json"
+    ).is_file()
+    needs_post_texts = needs_post_texts or (
+        "team-formation" in config.methods and not embeddings_ready
+    )
     if needs_post_texts:
-        required = {"item_id", "text"} if "sef" in config.methods else {"item_id"}
-        if (
-            "nvse" in config.methods
-            and not config.nvse_scores_are_precomputed
-            and (config.force or not config.nvse_scores.is_file())
-        ):
-            required |= {"title", "selftext"}
-        _validate_table(config.post_texts, required, "inputs.post_texts", errors)
+        # Item tables may carry ``text`` or ``title``/``selftext``; each is
+        # derived from the other at read time, so one of them suffices.
+        _validate_table(
+            config.post_texts,
+            set(layout.ITEM_TEXT_COLUMNS),
+            "inputs.items (post texts)",
+            errors,
+            item_table=True,
+        )
 
     if "sef" in config.methods:
         user_documents_path = (
@@ -673,36 +655,32 @@ def validate_reproduction_config(
     if config.nvse_scores.is_file():
         _validate_table(config.nvse_scores, NVSE_COLUMNS, "NVSE score cache", errors)
 
-    if "team-formation" in config.methods and "sef" not in config.methods:
+    if "team-formation" in config.methods and embeddings_ready:
         ids_path = config.embedding_cache / "post_ids.json"
         embeddings_path = config.embedding_cache / "post_embeddings.npy"
-        if not ids_path.is_file() or not embeddings_path.is_file():
-            errors.append(
-                "Team Formation without SEF requires precomputed post_ids.json and "
-                f"post_embeddings.npy under {config.embedding_cache}"
-            )
-        else:
-            try:
-                ids = json.loads(ids_path.read_text(encoding="utf-8"))
-                matrix = np.load(embeddings_path, mmap_mode="r")
-                if matrix.ndim != 2 or len(ids) != len(matrix):
-                    errors.append(
-                        f"Invalid/misaligned embedding cache under {config.embedding_cache}"
-                    )
-            except Exception as exc:
-                errors.append(f"Cannot validate embedding cache {config.embedding_cache}: {exc}")
+        try:
+            ids = json.loads(ids_path.read_text(encoding="utf-8"))
+            matrix = np.load(embeddings_path, mmap_mode="r")
+            if matrix.ndim != 2 or len(ids) != len(matrix):
+                errors.append(f"Invalid/misaligned embedding cache under {config.embedding_cache}")
+        except Exception as exc:
+            errors.append(f"Cannot validate embedding cache {config.embedding_cache}: {exc}")
 
-    if "baselines" in config.methods:
+    score_baselines = [name for name in SCORE_BASELINES if name not in config.excluded_methods]
+    if "baselines" in config.methods and score_baselines:
         if config.external_scores is None or not config.external_scores.is_file():
             errors.append(
-                "inputs.external_scores is required when the complete baselines family is selected"
+                f"{', '.join(score_baselines)} need per-item scores (inputs.items with a "
+                f"'score' column; missing: {config.external_scores}). Provide them or skip "
+                "these baselines with " + " ".join(f"-x {name}" for name in score_baselines)
             )
         else:
             _validate_table(
                 config.external_scores,
-                {"item_id", "score"},
-                "inputs.external_scores",
+                set(layout.ITEM_SCORE_COLUMNS),
+                "inputs.items (scores)",
                 errors,
+                item_table=True,
             )
 
     if "community-notes" in config.methods:

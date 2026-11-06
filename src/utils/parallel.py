@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 import os
 from pathlib import Path
 import subprocess
+import sys
 from typing import Callable, Mapping, Sequence
 
 THREAD_ENVIRONMENT_VARIABLES = (
@@ -33,6 +34,8 @@ class CommandJob:
     command: list[str]
     environment: Mapping[str, str] | None = None
     resource: str = "cpu"
+    # Names of jobs that must finish successfully before this one starts.
+    after: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -48,6 +51,25 @@ class CommandResult:
     status: str
     environment: Mapping[str, str] | None
     resource: str
+    # Peak resident memory of the job process tree's largest process (POSIX).
+    peak_rss_mb: float | None = None
+
+
+def _run_process(
+    command: list[str], *, cwd: Path, env: Mapping[str, str]
+) -> tuple[int, float | None]:
+    """Run one command; also report its peak RSS where the OS exposes it."""
+    process = subprocess.Popen(command, cwd=cwd, env=dict(env))
+    if not hasattr(os, "wait4"):
+        return process.wait(), None
+    try:
+        _, status, usage = os.wait4(process.pid, 0)
+    except ChildProcessError:  # already reaped elsewhere
+        return process.wait(), None
+    process.returncode = os.waitstatus_to_exitcode(status)
+    # ru_maxrss is KiB on Linux and bytes on macOS.
+    scale = 1024 * 1024 if sys.platform == "darwin" else 1024
+    return process.returncode, usage.ru_maxrss / scale
 
 
 def resolve_worker_count(n_workers: int) -> int:
@@ -91,15 +113,15 @@ def _run_one(
 ) -> CommandResult:
     started = datetime.now(timezone.utc)
     return_code: int | None = None
+    peak_rss_mb: float | None = None
     if not dry_run:
         if announce is not None:
             announce(job.name)
-        return_code = subprocess.run(
+        return_code, peak_rss_mb = _run_process(
             job.command,
             cwd=cwd,
-            check=False,
             env=worker_environment(threads_per_worker, job.environment),
-        ).returncode
+        )
     ended = datetime.now(timezone.utc)
     return CommandResult(
         name=job.name,
@@ -111,7 +133,39 @@ def _run_one(
         status="dry-run" if dry_run else "ok" if return_code == 0 else "failed",
         environment=job.environment,
         resource=job.resource,
+        peak_rss_mb=peak_rss_mb,
     )
+
+
+def _skipped(job: CommandJob, reason: str) -> CommandResult:
+    now = datetime.now(timezone.utc).isoformat()
+    return CommandResult(
+        name=job.name,
+        command=job.command,
+        started_at_utc=now,
+        ended_at_utc=now,
+        duration_seconds=0.0,
+        return_code=None,
+        status=f"skipped: {reason}",
+        environment=job.environment,
+        resource=job.resource,
+    )
+
+
+def _validate_dependencies(jobs: Sequence[CommandJob]) -> None:
+    """Require unique names and dependencies that point to earlier jobs.
+
+    Requiring earlier positions makes the list a topological order, so the
+    serial path can simply run it front to back.
+    """
+    seen: set[str] = set()
+    for job in jobs:
+        if job.name in seen:
+            raise ValueError(f"Duplicate job name: {job.name}")
+        unknown = [name for name in job.after if name not in seen]
+        if unknown:
+            raise ValueError(f"Job {job.name!r} depends on unknown/later job(s): {unknown}")
+        seen.add(job.name)
 
 
 def run_command_jobs(
@@ -127,10 +181,17 @@ def run_command_jobs(
 ) -> list[CommandResult]:
     """Run commands with bounded concurrency and deterministic result ordering."""
 
+    _validate_dependencies(jobs)
     workers = min(resolve_worker_count(n_workers), max(len(jobs), 1))
     if dry_run or workers == 1:
         results: list[CommandResult] = []
+        failed: set[str] = set()
         for job in jobs:
+            blocked = [name for name in job.after if name in failed]
+            if blocked:
+                results.append(_skipped(job, f"dependency failed ({', '.join(blocked)})"))
+                failed.add(job.name)
+                continue
             result = _run_one(
                 job,
                 cwd=cwd,
@@ -139,8 +200,10 @@ def run_command_jobs(
                 announce=announce,
             )
             results.append(result)
-            if result.return_code not in (None, 0) and not continue_on_error:
-                break
+            if result.return_code not in (None, 0):
+                failed.add(job.name)
+                if not continue_on_error:
+                    break
         return results
 
     indexed_results: dict[int, CommandResult] = {}
@@ -151,6 +214,8 @@ def run_command_jobs(
     if any(value < 1 for value in limits.values()):
         raise ValueError("Every resource limit must be at least 1")
     resources_in_use: dict[str, int] = {}
+    succeeded: set[str] = set()
+    failed: set[str] = set()
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="method-job") as executor:
         while pending or futures:
             submitted = True
@@ -158,6 +223,17 @@ def run_command_jobs(
                 submitted = False
                 for pending_position, index in enumerate(pending):
                     job = jobs[index]
+                    blocked = [name for name in job.after if name in failed]
+                    if blocked:
+                        pending.pop(pending_position)
+                        indexed_results[index] = _skipped(
+                            job, f"dependency failed ({', '.join(blocked)})"
+                        )
+                        failed.add(job.name)
+                        submitted = True
+                        break
+                    if any(name not in succeeded for name in job.after):
+                        continue
                     limit = limits.get(job.resource, workers)
                     if resources_in_use.get(job.resource, 0) >= limit:
                         continue
@@ -167,6 +243,8 @@ def run_command_jobs(
                     break
                 if not submitted:
                     break
+                if index in indexed_results:
+                    continue
                 future = executor.submit(
                     _run_one,
                     job,
@@ -185,6 +263,10 @@ def run_command_jobs(
                 indexed_results[index] = result
                 resource = jobs[index].resource
                 resources_in_use[resource] -= 1
-                if result.return_code not in (None, 0) and not continue_on_error:
-                    stop_submitting = True
+                if result.return_code in (None, 0):
+                    succeeded.add(jobs[index].name)
+                else:
+                    failed.add(jobs[index].name)
+                    if not continue_on_error:
+                        stop_submitting = True
     return [indexed_results[index] for index in sorted(indexed_results)]

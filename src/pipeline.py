@@ -16,6 +16,14 @@ from typing import Annotated, Mapping, Sequence
 
 import typer
 
+from src.layout import (
+    DEFAULT_EMBEDDING_MODEL,
+    DEFAULT_NORMVIO_BERT,
+    NORMVIO_CATEGORIES,
+    PROJECT_ROOT,
+    DatasetLayout,
+    InputBundle,
+)
 from src.reproducibility import (
     ReproductionConfig,
     load_reproduction_config,
@@ -23,25 +31,12 @@ from src.reproducibility import (
     resolve_method_selection,
     validate_reproduction_config,
 )
-from src.utils.parallel import CommandJob, resolve_worker_count, run_command_jobs
+from src.utils.hashing import sha256_file
+from src.utils.parallel import CommandJob, run_command_jobs
 from src.utils.splits import discover_splits
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_INPUT = Path("data/processed/final_intersection_dataset.csv")
-DEFAULT_SPLITS = Path("data/splits/reddit")
-DEFAULT_RESULTS = Path("results/reddit")
-DEFAULT_REPORT = Path("results/report")
 KFOLD_DIRNAME = "kfold"
-DEFAULT_CAUSAL_FEATURES = Path("data/interim/reddit/features/causal_user_vote_features.parquet")
-DEFAULT_NVSE_SCORES = Path("cache/nvse/post_violation_scores.parquet")
-DEFAULT_NVSE_WORK = Path("cache/nvse/work")
-DEFAULT_POST_TEXTS = Path("data/interim/reddit/auxiliary/post_texts.parquet")
-DEFAULT_USER_DOCUMENTS = Path("data/interim/reddit/auxiliary/user_documents.parquet")
-DEFAULT_EXTERNAL_SCORES = Path("data/interim/reddit/auxiliary/moderated_posts_scores.parquet")
-DEFAULT_NORMVIO_MODELS = Path("external/normvio/normvio_redditmodels")
-DEFAULT_NORMVIO_BERT = "DeepPavlov/bert-base-cased-conversational"
-DEFAULT_EMBEDDING_CACHE = Path("cache/embeddings")
-DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+# Every path option defaults to the --dataset layout (src/layout.py).
 
 METHOD_MODULES = {
     "baselines": "src.methods.baselines",
@@ -77,7 +72,10 @@ TEAM_FORMATION_MODULES = {
     "boc_stacking": "src.methods.team_formation_v2.boc_stacking.pipeline",
     "role_nsga2": "src.methods.team_formation_v2.role_nsga2.pipeline",
 }
-NESTED_METHODS = {"team-formation": TEAM_FORMATION_METHODS}
+NESTED_METHODS = {
+    "baselines": BASELINE_METHODS,
+    "team-formation": TEAM_FORMATION_METHODS,
+}
 
 app = typer.Typer(
     add_completion=False,
@@ -103,16 +101,6 @@ def _python_module(module: str, *arguments: object) -> list[str]:
         value.as_posix() if isinstance(value, Path) else str(value) for value in arguments
     ]
     return [Path(sys.executable).as_posix(), "-B", "-m", module, *serialized]
-
-
-def _sha256(path: Path) -> str | None:
-    if not path.is_file():
-        return None
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _relative(path: Path) -> str:
@@ -154,7 +142,7 @@ def _input_fingerprints(splits_root: Path, extra_inputs: Sequence[Path] = ()) ->
     if root.exists():
         paths.extend(sorted(root.rglob("*manifest.json")))
         paths.extend(sorted(root.rglob("*_votes.parquet")))
-    return {_relative(path): digest for path in paths if (digest := _sha256(path)) is not None}
+    return {_relative(path): digest for path in paths if (digest := sha256_file(path)) is not None}
 
 
 def _source_tree_sha256() -> str:
@@ -162,7 +150,7 @@ def _source_tree_sha256() -> str:
     digest = hashlib.sha256()
     for path in sorted((PROJECT_ROOT / "src").rglob("*.py")):
         digest.update(_relative(path).encode("utf-8"))
-        file_digest = _sha256(path)
+        file_digest = sha256_file(path)
         if file_digest is not None:
             digest.update(file_digest.encode("ascii"))
     return digest.hexdigest()
@@ -237,11 +225,15 @@ def _execute(
             "return_code": result.return_code,
             "status": result.status,
             "resource": result.resource,
+            "peak_rss_mb": result.peak_rss_mb,
             "environment_overrides": dict(result.environment or {}),
         }
         for result in results
     ]
     failure = any(result.return_code not in (None, 0) for result in results)
+    if dry_run:
+        # A dry run only prints the plan; it must not overwrite real manifests.
+        return
     _write_run_manifest(
         manifest_path,
         category,
@@ -274,10 +266,12 @@ def _load_config(path: Path) -> ReproductionConfig:
 
 
 def _direct_config(
-    input_path: Path,
+    input_path: Path | None,
     dataset: str,
     methods: Sequence[str],
     *,
+    inputs_dir: Path | None = None,
+    items: Path | None = None,
     post_texts: Path | None,
     user_documents: Path | None,
     user_contributions: Path | None,
@@ -291,15 +285,20 @@ def _direct_config(
     device: str,
     excluded_methods: Sequence[str] = (),
 ) -> ReproductionConfig:
-    """Build the conventional layout used by the simple ``--input`` interface."""
-    if not dataset or any(
-        character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
-        for character in dataset
-    ):
-        raise typer.BadParameter(
-            "dataset must contain only letters, digits, '.', '_' or '-'",
-            param_hint="--dataset",
+    """Build the conventional layout used by the simple CLI interface.
+
+    Precedence for each input: explicit option > ``--inputs`` folder >
+    the dataset's conventional location (see ``src/layout.py``).
+    """
+    try:
+        paths = DatasetLayout(dataset)
+        bundle = (
+            InputBundle.from_directory(_absolute(inputs_dir))
+            if inputs_dir is not None
+            else paths.default_inputs()
         )
+    except (ValueError, FileNotFoundError) as exc:
+        raise typer.BadParameter(str(exc), param_hint="--dataset/--inputs") from exc
     try:
         selected, normalized_exclusions = resolve_method_selection(
             methods,
@@ -309,46 +308,36 @@ def _direct_config(
         )
     except ValueError as exc:
         raise typer.BadParameter(str(exc), param_hint="--exclude-method") from exc
-    interim = PROJECT_ROOT / "data" / "interim" / dataset
-    processed = PROJECT_ROOT / "data" / "processed" / dataset
-    cache = PROJECT_ROOT / "cache" / dataset
-    if dataset == "reddit":
-        processed = PROJECT_ROOT / "data" / "processed"
-        cache = PROJECT_ROOT / "cache"
-    default_user_contributions = PROJECT_ROOT / "data" / "raw" / dataset / "user_contributions"
-    report = PROJECT_ROOT / "results" / "report" / dataset
-    if dataset == "reddit":
-        default_user_contributions = (
-            PROJECT_ROOT / "data" / "raw" / "user_contributions" / "user_contributions"
+
+    def supplied(path: Path | None, default: Path | None) -> Path | None:
+        return _absolute(path) if path is not None else default
+
+    votes = supplied(input_path, bundle.votes)
+    if votes is None:
+        raise typer.BadParameter(
+            "provide the votes table with --input, or an --inputs folder containing votes.*",
+            param_hint="--input",
         )
-        report = PROJECT_ROOT / "results" / "report"
-
-    def supplied(path: Path | None, default: Path) -> Path:
-        if path is None:
-            return default
-        return path if path.is_absolute() else PROJECT_ROOT / path
-
-    auxiliary = interim / "auxiliary"
     return ReproductionConfig(
         source=None,
         dataset=dataset,
-        votes=input_path if input_path.is_absolute() else PROJECT_ROOT / input_path,
-        post_texts=supplied(post_texts, auxiliary / "post_texts.parquet"),
-        user_documents=supplied(user_documents, auxiliary / "user_documents.parquet"),
-        user_contributions=supplied(user_contributions, default_user_contributions),
-        user_metadata=supplied(user_metadata, processed / "user_metadata.csv"),
-        external_scores=supplied(external_scores, auxiliary / "moderated_posts_scores.parquet"),
-        normvio_models=PROJECT_ROOT / "external" / "normvio" / "normvio_redditmodels",
+        votes=votes,
+        post_texts=supplied(post_texts or items, bundle.post_texts),
+        user_documents=supplied(user_documents, bundle.user_documents or paths.user_documents),
+        user_contributions=supplied(user_contributions, bundle.user_contributions),
+        user_metadata=supplied(user_metadata, bundle.user_metadata),
+        external_scores=supplied(external_scores or items, bundle.item_scores),
+        normvio_models=paths.normvio_models,
         normvio_bert=DEFAULT_NORMVIO_BERT,
         embedding_model=DEFAULT_EMBEDDING_MODEL,
-        interim=interim,
-        splits=PROJECT_ROOT / "data" / "splits" / dataset,
-        results=PROJECT_ROOT / "results" / dataset,
-        report=report,
-        cache=cache,
-        causal_features=interim / "features" / "causal_user_vote_features.parquet",
-        nvse_scores=cache / "nvse" / "post_violation_scores.parquet",
-        embedding_cache=cache / "embeddings",
+        interim=paths.interim,
+        splits=paths.splits,
+        results=paths.results,
+        report=paths.report,
+        cache=paths.cache,
+        causal_features=paths.causal_features,
+        nvse_scores=paths.nvse_scores,
+        embedding_cache=paths.embedding_cache,
         causal_features_are_precomputed=False,
         nvse_scores_are_precomputed=False,
         methods=selected,
@@ -368,6 +357,10 @@ def _direct_config(
         skip_existing_team_methods=False,
         graph_sections=("all",),
     )
+
+
+def _absolute(path: Path) -> Path:
+    return path if path.is_absolute() else PROJECT_ROOT / path
 
 
 def _preflight(config: ReproductionConfig) -> None:
@@ -418,7 +411,7 @@ def _parallel_methods_command(
 
     post_texts = _optional_path(config.post_texts, config.interim / "missing_post_texts")
     user_documents = _optional_path(
-        config.user_documents, config.interim / "auxiliary" / "user_documents.parquet"
+        config.user_documents, DatasetLayout(config.dataset).user_documents
     )
     external_scores = _optional_path(
         config.external_scores, config.interim / "missing_external_scores"
@@ -458,6 +451,8 @@ def _parallel_methods_command(
         memory_workers,
         "--manifest",
         manifest,
+        # The reproduce plan builds the semantic cache as its own stage.
+        "--no-prepare-cache",
     ]
     for method in config.methods:
         args.extend(("--method", method))
@@ -474,6 +469,39 @@ def _parallel_methods_command(
     return _python_module("src.pipeline", *args)
 
 
+def _semantic_cache_command(
+    *,
+    votes: Path,
+    post_texts: Path,
+    user_documents: Path,
+    embedding_cache: Path,
+    embedding_model: str,
+    splits_roots: Sequence[Path],
+    posts_only: bool,
+    force: bool = False,
+) -> list[str]:
+    command = _python_module(
+        "src.data_preparation.build_semantic_cache",
+        "--input",
+        votes,
+        "--post-texts",
+        post_texts,
+        "--user-documents",
+        user_documents,
+        "--embedding-dir",
+        embedding_cache,
+        "--embedding-model",
+        embedding_model,
+    )
+    for root in splits_roots:
+        command.extend(("--splits-root", root.as_posix()))
+    if posts_only:
+        command.append("--posts-only")
+    if force:
+        command.append("--force")
+    return command
+
+
 def _reproduction_commands(
     config: ReproductionConfig,
     *,
@@ -481,9 +509,25 @@ def _reproduction_commands(
     threads_per_worker: int = 1,
     memory_workers: int = 1,
     gpu_devices: Sequence[str] = (),
-) -> list[tuple[str, list[str]]]:
-    """Build the complete preparation/evaluation/report plan for one dataset."""
-    commands: list[tuple[str, list[str]]] = []
+) -> list[CommandJob]:
+    """Build the complete preparation/evaluation/report plan as a dependency graph.
+
+    Jobs are listed in a valid serial order; with ``--n-workers > 1`` the
+    independent preparation stages (causal features, NVSE scoring, the semantic
+    cache, K-fold splits) run concurrently, and every method waits for all of
+    them.
+    """
+    jobs: list[CommandJob] = []
+    accelerator = "accelerator" if config.device.startswith("cuda") or gpu_devices else "cpu"
+
+    def add(name: str, command: list[str], after: Sequence[str] = (), **kwargs) -> str:
+        known = {job.name for job in jobs}
+        jobs.append(
+            CommandJob(name, command, after=tuple(dep for dep in after if dep in known), **kwargs)
+        )
+        return name
+
+    paths = DatasetLayout(config.dataset)
     datasets_dir = config.interim / "datasets"
     dataset_marker = datasets_dir / "prepare_reddit_data.manifest.json"
     dataset_scheduled = config.prepare_dataset and (
@@ -500,59 +544,72 @@ def _reproduction_commands(
             config.splits,
             "--seed",
             config.seed,
+            "--external-scores",
+            _optional_path(config.external_scores, config.interim / "missing_external_scores"),
+            "--post-texts",
+            _optional_path(config.post_texts, config.interim / "missing_post_texts"),
         )
-        if config.external_scores is not None:
-            command.extend(("--external-scores", config.external_scores.as_posix()))
-        if config.post_texts is not None:
-            command.extend(("--post-texts", config.post_texts.as_posix()))
-        commands.append(("prepare-dataset", command))
+        add("prepare-dataset", command)
+
+    kfold_root = _scoped_root(config.splits, KFOLD_DIRNAME)
+    if (
+        config.kfold
+        and not dataset_scheduled
+        and (config.force or not (kfold_root / "manifest.json").exists())
+    ):
+        add(
+            "prepare-kfold",
+            _python_module(
+                "src.data_preparation.prepare_kfold_splits",
+                "--splits-root",
+                config.splits,
+                "--output-root",
+                kfold_root,
+                "--seed",
+                config.seed,
+            ),
+        )
 
     needs_user_documents = "sef" in config.methods
-    user_documents = _optional_path(
-        config.user_documents, config.interim / "auxiliary" / "user_documents.parquet"
-    )
-    user_documents_scheduled = needs_user_documents and not user_documents.is_file()
+    user_documents = _optional_path(config.user_documents, paths.user_documents)
     if (
-        user_documents_scheduled
+        needs_user_documents
+        and not user_documents.is_file()
         and config.user_contributions is not None
         and config.user_contributions.is_dir()
     ):
-        commands.append(
-            (
-                "prepare-user-documents-local",
-                _python_module(
-                    "src.data_preparation.build_user_documents",
-                    "--input-dir",
-                    config.user_contributions,
-                    "--users-from",
-                    config.votes,
-                    "--output",
-                    user_documents,
-                    "--n-user-docs",
-                    config.n_user_documents,
-                ),
-            )
+        add(
+            "prepare-user-documents-local",
+            _python_module(
+                "src.data_preparation.build_user_documents",
+                "--input-dir",
+                config.user_contributions,
+                "--users-from",
+                config.votes,
+                "--output",
+                user_documents,
+                "--n-user-docs",
+                config.n_user_documents,
+            ),
         )
-
     if needs_user_documents and config.download_user_documents:
-        commands.append(
-            (
-                "download-missing-user-documents",
-                _python_module(
-                    "src.data_preparation.fetch_reddit_auxiliary_data",
-                    "--section",
-                    "user-documents",
-                    "--input-csv",
-                    config.votes,
-                    "--output-dir",
-                    user_documents.parent,
-                    "--user-documents-output",
-                    user_documents,
-                    "--n-user-docs",
-                    config.n_user_documents,
-                    "--missing-user-documents-only",
-                ),
-            )
+        add(
+            "download-missing-user-documents",
+            _python_module(
+                "src.data_preparation.fetch_reddit_auxiliary_data",
+                "--section",
+                "user-documents",
+                "--input-csv",
+                config.votes,
+                "--output-dir",
+                user_documents.parent,
+                "--user-documents-output",
+                user_documents,
+                "--n-user-docs",
+                config.n_user_documents,
+                "--missing-user-documents-only",
+            ),
+            after=["prepare-user-documents-local"],
         )
 
     causal_needed = bool({"nvse", "sef", "team-formation"} & set(config.methods))
@@ -584,7 +641,7 @@ def _reproduction_commands(
         )
         if config.force:
             command.extend(("--rebuild-index", "--rebuild-snapshots"))
-        commands.append(("prepare-causal-user-features", command))
+        add("prepare-causal-user-features", command)
 
     if (
         "nvse" in config.methods
@@ -598,8 +655,6 @@ def _reproduction_commands(
             config.splits,
             "--post_texts",
             config.post_texts,
-            "--docs",
-            _optional_path(config.user_documents, config.interim / "missing_user_documents"),
             "--models",
             config.normvio_models,
             "--bert_model",
@@ -615,80 +670,76 @@ def _reproduction_commands(
         )
         if config.force:
             command.append("--force-rescore")
-        commands.append(("prepare-nvse-scores", command))
+        add("prepare-nvse-scores", command, after=["prepare-dataset"], resource=accelerator)
 
-    kfold_root = _scoped_root(config.splits, KFOLD_DIRNAME)
-    if (
-        config.kfold
-        and not dataset_scheduled
-        and (config.force or not (kfold_root / "manifest.json").exists())
-    ):
-        commands.append(
-            (
-                "prepare-kfold",
-                _python_module(
-                    "src.data_preparation.prepare_kfold_splits",
-                    "--splits-root",
-                    config.splits,
-                    "--output-root",
-                    kfold_root,
-                    "--seed",
-                    config.seed,
-                ),
-            )
-        )
-
-    commands.append(
-        (
-            "methods",
-            _parallel_methods_command(
-                config,
-                splits_root=config.splits,
-                results_root=config.results,
-                manifest=config.results / "reproducibility" / "latest_methods_run.json",
-                n_workers=n_workers,
-                threads_per_worker=threads_per_worker,
-                memory_workers=memory_workers,
-                gpu_devices=gpu_devices,
+    if {"sef", "team-formation"} & set(config.methods) and config.post_texts is not None:
+        add(
+            "prepare-sef-cache",
+            _semantic_cache_command(
+                votes=config.votes,
+                post_texts=config.post_texts,
+                user_documents=user_documents,
+                embedding_cache=config.embedding_cache,
+                embedding_model=config.embedding_model,
+                splits_roots=[config.splits, *([kfold_root] if config.kfold else [])],
+                posts_only="sef" not in config.methods,
+                force=config.force,
             ),
+            after=[
+                "prepare-dataset",
+                "prepare-kfold",
+                "prepare-user-documents-local",
+                "download-missing-user-documents",
+            ],
+            resource=accelerator,
         )
+
+    preparation = [job.name for job in jobs]
+    method_args = dict(
+        n_workers=n_workers,
+        threads_per_worker=threads_per_worker,
+        memory_workers=memory_workers,
+        gpu_devices=gpu_devices,
+    )
+    add(
+        "methods",
+        _parallel_methods_command(
+            config,
+            splits_root=config.splits,
+            results_root=config.results,
+            manifest=config.results / "reproducibility" / "latest_methods_run.json",
+            **method_args,
+        ),
+        after=preparation,
     )
 
     if config.kfold:
         kfold_results = _scoped_root(config.results, KFOLD_DIRNAME)
-        commands.append(
-            (
-                "kfold-methods",
-                _parallel_methods_command(
-                    config,
-                    splits_root=kfold_root,
-                    results_root=kfold_results,
-                    manifest=(
-                        config.results
-                        / "reproducibility"
-                        / "latest_kfold_methods_run.json"
-                    ),
-                    n_workers=n_workers,
-                    threads_per_worker=threads_per_worker,
-                    memory_workers=memory_workers,
-                    gpu_devices=gpu_devices,
-                ),
-            )
+        add(
+            "kfold-methods",
+            _parallel_methods_command(
+                config,
+                splits_root=kfold_root,
+                results_root=kfold_results,
+                manifest=config.results / "reproducibility" / "latest_kfold_methods_run.json",
+                **method_args,
+            ),
+            # Each method stage already uses every worker; run them in turn.
+            after=["methods"],
         )
-        commands.append(
-            (
-                "kfold-graphs",
-                _python_module(
-                    "src.comparison.graphs",
-                    "--k-fold-only",
-                    "--splits-root",
-                    kfold_root,
-                    "--results-root",
-                    kfold_results,
-                    "--output-dir",
-                    config.report / "kfold",
-                ),
-            )
+        add(
+            "kfold-graphs",
+            _python_module(
+                "src.comparison.graphs",
+                "--k-fold-only",
+                "--splits-root",
+                kfold_root,
+                "--results-root",
+                kfold_results,
+                "--output-dir",
+                config.report / "kfold",
+            ),
+            after=["kfold-methods"],
         )
 
     if config.graphs:
@@ -702,8 +753,8 @@ def _reproduction_commands(
         ]
         for section in config.graph_sections:
             graph_args.extend(("--section", section))
-        commands.append(("graphs", _python_module("src.comparison.graphs", *graph_args)))
-    return commands
+        add("graphs", _python_module("src.comparison.graphs", *graph_args), after=["methods"])
+    return jobs
 
 
 @app.command("validate")
@@ -743,9 +794,25 @@ def reproduce(
             help="Method name to omit, such as bandit or sef; repeat for several.",
         ),
     ] = None,
+    inputs_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--inputs",
+            help="Folder of conventionally named inputs: votes.*, items.*, "
+            "user_contributions/, user_metadata.* (see README).",
+        ),
+    ] = None,
+    items: Annotated[
+        Path | None,
+        typer.Option(
+            "--items",
+            help="Per-item table (item_id + text and/or title/selftext + score) for "
+            "SEF, NVSE, Team Formation and BL4/BL5.",
+        ),
+    ] = None,
     post_texts: Annotated[
         Path | None,
-        typer.Option(help="Local post-text table; otherwise use the conventional path."),
+        typer.Option(help="Override the post-text source only (legacy; prefer --items)."),
     ] = None,
     user_documents: Annotated[
         Path | None,
@@ -761,7 +828,7 @@ def reproduce(
     ] = None,
     external_scores: Annotated[
         Path | None,
-        typer.Option(help="Local per-item Reddit/Arctic Shift score table."),
+        typer.Option(help="Override the per-item score source only (legacy; prefer --items)."),
     ] = None,
     download_user_documents: Annotated[
         bool,
@@ -826,8 +893,8 @@ def reproduce(
     ] = False,
 ) -> None:
     """Prepare, evaluate, and render one dataset in a single launch."""
-    if config_path is not None and input_path is not None:
-        raise typer.BadParameter("use either --input or --config, not both")
+    if config_path is not None and (input_path is not None or inputs_dir is not None):
+        raise typer.BadParameter("use either --input/--inputs or --config, not both")
     if config_path is not None:
         config = _load_config(config_path)
         if exclude_method:
@@ -845,12 +912,14 @@ def reproduce(
                 methods=selected,
                 excluded_methods=normalized_exclusions,
             )
-    elif input_path is not None:
+    else:
         config = _direct_config(
             input_path,
             dataset,
             method or ["all"],
             excluded_methods=exclude_method or [],
+            inputs_dir=inputs_dir,
+            items=items,
             post_texts=post_texts,
             user_documents=user_documents,
             user_contributions=user_contributions,
@@ -863,8 +932,6 @@ def reproduce(
             graphs=graphs,
             device=device,
         )
-    else:
-        raise typer.BadParameter("provide the votes table with --input", param_hint="--input")
     _preflight(config)
     commands = _reproduction_commands(
         config,
@@ -890,21 +957,11 @@ def reproduce(
         )
         if path is not None and path.is_file()
     ]
-    command_names = {name for name, _ in commands}
+    command_names = {job.name for job in commands}
     if "prepare-nvse-scores" in command_names and config.normvio_models is not None:
         extra_inputs.extend(
             config.normvio_models / category / "finetuned_model.pt"
-            for category in (
-                "spam",
-                "meta-rules",
-                "content",
-                "harassment",
-                "hatespeech",
-                "format",
-                "off-topic",
-                "trolling",
-                "incivility",
-            )
+            for category in NORMVIO_CATEGORIES
         )
         extra_inputs.extend(_local_model_files(config.normvio_bert))
     if "sef" in config.methods:
@@ -917,54 +974,77 @@ def reproduce(
         dry_run=dry_run,
         continue_on_error=config.continue_on_error,
         extra_inputs=extra_inputs,
+        # Independent preparation stages share the worker budget; the nested
+        # method stages (which start only after them) use it in full.
+        n_workers=n_workers,
+        threads_per_worker=threads_per_worker,
+        resource_limits={"accelerator": 1},
     )
+
+
+DatasetOption = Annotated[
+    str,
+    typer.Option("--dataset", help="Dataset whose conventional paths fill unset options."),
+]
+
+
+def _layout(dataset: str) -> DatasetLayout:
+    try:
+        return DatasetLayout(dataset)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--dataset") from exc
+
+
+def _votes_or_fail(path: Path | None, dataset: str) -> Path:
+    if path is None:
+        raise typer.BadParameter(
+            f"no votes table found for dataset {dataset!r}; pass --input or place votes.* "
+            f"in {DatasetLayout(dataset).raw}",
+            param_hint="--input",
+        )
+    return path
 
 
 @prepare_app.command("auxiliary")
 def prepare_auxiliary(
     section: Annotated[
         str,
-        typer.Option(
-            help="post-texts, user-documents, reddit-scores, moderated-items, or all."
-        ),
-    ] = "all",
+        typer.Option(help="items (texts + scores), user-documents, or all."),
+    ] = "items",
     input_csv: Annotated[
-        Path,
-        typer.Option(help="Table supplying item_id, username, and timestamp."),
-    ] = DEFAULT_INPUT,
-    votes: Annotated[
-        Path,
-        typer.Option(help="Vote table used for Reddit score acquisition."),
-    ] = DEFAULT_INPUT,
+        Path | None,
+        typer.Option(help="Votes table supplying item_id, username, community, label."),
+    ] = None,
     output_dir: Annotated[
-        Path,
+        Path | None,
         typer.Option(help="Destination for the fetched Parquet tables and manifest."),
-    ] = Path("data/interim/reddit/auxiliary"),
+    ] = None,
+    dataset: DatasetOption = "reddit",
     dry_run: Annotated[
         bool,
         typer.Option("--dry-run", help="Print the acquisition command without running it."),
     ] = False,
 ) -> None:
     """Acquire optional Arctic Shift inputs once (network access required)."""
-    allowed = {"post-texts", "user-documents", "reddit-scores", "moderated-items", "all"}
-    if section not in allowed:
-        raise typer.BadParameter(f"section must be one of {sorted(allowed)}")
+    paths = _layout(dataset)
+    aliases = {"post-texts": "items", "reddit-scores": "items", "moderated-items": "items"}
+    section = aliases.get(section, section)
+    if section not in {"items", "user-documents", "all"}:
+        raise typer.BadParameter("section must be one of ['all', 'items', 'user-documents']")
     command = _python_module(
         "src.data_preparation.fetch_reddit_auxiliary_data",
         "--section",
         section,
         "--input-csv",
-        input_csv,
-        "--votes",
-        votes,
+        _votes_or_fail(input_csv or paths.default_inputs().votes, dataset),
         "--output-dir",
-        output_dir,
+        output_dir or paths.auxiliary,
     )
     _execute(
         [("auxiliary", command)],
         category="prepare",
-        manifest_path=Path("data/interim/reddit/prepare_auxiliary_run.json"),
-        splits_root=DEFAULT_SPLITS,
+        manifest_path=paths.run_manifests / "prepare_auxiliary_run.json",
+        splits_root=paths.splits,
         dry_run=dry_run,
     )
 
@@ -972,17 +1052,17 @@ def prepare_auxiliary(
 @prepare_app.command("user-documents")
 def prepare_user_documents(
     input_dir: Annotated[
-        Path,
+        Path | None,
         typer.Option(help="Directory containing one contribution JSONL per user."),
-    ] = Path("data/raw/user_contributions/user_contributions"),
+    ] = None,
     users_from: Annotated[
-        Path,
+        Path | None,
         typer.Option(help="Votes table selecting users and the relevant time window."),
-    ] = DEFAULT_INPUT,
+    ] = None,
     output: Annotated[
-        Path,
+        Path | None,
         typer.Option(help="Destination user_documents.parquet."),
-    ] = DEFAULT_USER_DOCUMENTS,
+    ] = None,
     n_user_docs: Annotated[
         int,
         typer.Option(min=2, help="Maximum documents per user, split between posts/comments."),
@@ -994,12 +1074,18 @@ def prepare_user_documents(
             help="Top up users below the local document limit with Arctic Shift.",
         ),
     ] = False,
+    dataset: DatasetOption = "reddit",
     force: Annotated[bool, typer.Option("--force")] = False,
     dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
 ) -> None:
     """Build user documents locally; optionally top up gaps from Arctic Shift."""
+    paths = _layout(dataset)
+    defaults = paths.default_inputs()
+    input_dir = input_dir or defaults.user_contributions
+    users_from = _votes_or_fail(users_from or defaults.votes, dataset)
+    output = output or paths.user_documents
     commands: list[tuple[str, list[str]]] = []
-    target = output if output.is_absolute() else PROJECT_ROOT / output
+    target = _absolute(output)
     if force or not target.is_file():
         command = _python_module(
             "src.data_preparation.build_user_documents",
@@ -1043,45 +1129,53 @@ def prepare_user_documents(
         commands,
         category="prepare",
         manifest_path=output.parent / "prepare_user_documents_run.json",
-        splits_root=DEFAULT_SPLITS,
+        splits_root=paths.splits,
         dry_run=dry_run,
     )
 
 
 @prepare_app.command("dataset")
 def prepare_dataset(
-    input_path: Annotated[Path, typer.Option("--input")] = DEFAULT_INPUT,
-    output_dir: Annotated[Path, typer.Option()] = Path("data/interim/reddit/datasets"),
-    splits_dir: Annotated[Path, typer.Option()] = DEFAULT_SPLITS,
-    external_scores: Annotated[Path | None, typer.Option()] = None,
-    post_texts: Annotated[Path | None, typer.Option()] = None,
+    input_path: Annotated[Path | None, typer.Option("--input")] = None,
+    output_dir: Annotated[Path | None, typer.Option()] = None,
+    splits_dir: Annotated[Path | None, typer.Option()] = None,
+    items: Annotated[
+        Path | None, typer.Option(help="Per-item table used for the population filters.")
+    ] = None,
+    external_scores: Annotated[Path | None, typer.Option(help="Legacy override.")] = None,
+    post_texts: Annotated[Path | None, typer.Option(help="Legacy override.")] = None,
     seed: Annotated[int, typer.Option()] = 10,
+    dataset: DatasetOption = "reddit",
     force: Annotated[bool, typer.Option("--force")] = False,
     dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
 ) -> None:
     """Create the cleaned dataset and all canonical splits once."""
+    paths = _layout(dataset)
+    defaults = paths.default_inputs()
+    output_dir = output_dir or paths.datasets_dir
+    splits_dir = splits_dir or paths.splits
     marker = output_dir / "prepare_reddit_data.manifest.json"
     if _prepared(marker, force) and not dry_run:
         return
     command = _python_module(
         "src.data_preparation.prepare_reddit_data",
         "--input",
-        input_path,
+        _votes_or_fail(input_path or defaults.votes, dataset),
         "--output-dir",
         output_dir,
         "--splits-dir",
         splits_dir,
         "--seed",
         seed,
+        "--external-scores",
+        external_scores or items or defaults.item_scores,
+        "--post-texts",
+        post_texts or items or defaults.post_texts,
     )
-    if external_scores is not None:
-        command.extend(("--external-scores", external_scores.as_posix()))
-    if post_texts is not None:
-        command.extend(("--post-texts", post_texts.as_posix()))
     _execute(
         [("dataset-and-splits", command)],
         category="prepare",
-        manifest_path=Path("data/interim/reddit/prepare_dataset_run.json"),
+        manifest_path=paths.run_manifests / "prepare_dataset_run.json",
         splits_root=splits_dir,
         dry_run=dry_run,
     )
@@ -1089,7 +1183,7 @@ def prepare_dataset(
 
 @prepare_app.command("kfold")
 def prepare_kfold(
-    splits_root: Annotated[Path, typer.Option()] = DEFAULT_SPLITS,
+    splits_root: Annotated[Path | None, typer.Option()] = None,
     output_root: Annotated[
         Path | None,
         typer.Option(help="Defaults to <splits-root>/kfold."),
@@ -1100,10 +1194,13 @@ def prepare_kfold(
         float,
         typer.Option(min=0.05, max=0.90),
     ] = 0.40,
+    dataset: DatasetOption = "reddit",
     force: Annotated[bool, typer.Option("--force")] = False,
     dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
 ) -> None:
     """Build random and walk-forward folds from the three canonical splits."""
+    paths = _layout(dataset)
+    splits_root = splits_root or paths.splits
     destination = output_root or _scoped_root(splits_root, KFOLD_DIRNAME)
     marker = destination / "manifest.json"
     if _prepared(marker, force) and not dry_run:
@@ -1124,7 +1221,7 @@ def prepare_kfold(
     _execute(
         [("kfold-splits", command)],
         category="prepare",
-        manifest_path=Path("data/interim/reddit/prepare_kfold_run.json"),
+        manifest_path=paths.run_manifests / "prepare_kfold_run.json",
         splits_root=destination,
         dry_run=dry_run,
     )
@@ -1132,25 +1229,21 @@ def prepare_kfold(
 
 @prepare_app.command("user-features")
 def prepare_user_features(
-    input_dir: Annotated[Path, typer.Option()] = Path(
-        "data/raw/user_contributions/user_contributions"
-    ),
-    votes: Annotated[Path, typer.Option()] = DEFAULT_INPUT,
-    metadata: Annotated[Path, typer.Option()] = Path("data/processed/user_metadata.csv"),
-    post_texts: Annotated[Path, typer.Option()] = Path(
-        "data/interim/reddit/auxiliary/post_texts.parquet"
-    ),
-    output: Annotated[Path, typer.Option()] = DEFAULT_CAUSAL_FEATURES,
-    author_index: Annotated[Path, typer.Option()] = Path(
-        "data/interim/reddit/build_state/author_index.sqlite"
-    ),
-    feature_root: Annotated[Path, typer.Option()] = Path(
-        "data/interim/reddit/build_state/user_temporal_features"
-    ),
+    input_dir: Annotated[Path | None, typer.Option()] = None,
+    votes: Annotated[Path | None, typer.Option()] = None,
+    metadata: Annotated[Path | None, typer.Option()] = None,
+    post_texts: Annotated[Path | None, typer.Option("--items", "--post-texts")] = None,
+    output: Annotated[Path | None, typer.Option()] = None,
+    author_index: Annotated[Path | None, typer.Option()] = None,
+    feature_root: Annotated[Path | None, typer.Option()] = None,
+    dataset: DatasetOption = "reddit",
     force: Annotated[bool, typer.Option("--force")] = False,
     dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
 ) -> None:
     """Build causal, per-vote user-history features once."""
+    paths = _layout(dataset)
+    defaults = paths.default_inputs()
+    output = output or paths.causal_features
     if _prepared(output, force) and not dry_run:
         return
     command = _python_module(
@@ -1158,17 +1251,17 @@ def prepare_user_features(
         "--stage",
         "all",
         "--input-dir",
-        input_dir,
+        input_dir or defaults.user_contributions,
         "--votes",
-        votes,
+        _votes_or_fail(votes or defaults.votes, dataset),
         "--metadata",
-        metadata,
+        metadata or defaults.user_metadata,
         "--post-texts",
-        post_texts,
+        post_texts or defaults.post_texts,
         "--author-index",
-        author_index,
+        author_index or paths.author_index,
         "--feature-root",
-        feature_root,
+        feature_root or paths.feature_root,
         "--output",
         output,
     )
@@ -1177,26 +1270,29 @@ def prepare_user_features(
     _execute(
         [("causal-user-features", command)],
         category="prepare",
-        manifest_path=Path("data/interim/reddit/prepare_user_features_run.json"),
-        splits_root=DEFAULT_SPLITS,
+        manifest_path=paths.run_manifests / "prepare_user_features_run.json",
+        splits_root=paths.splits,
         dry_run=dry_run,
     )
 
 
 @prepare_app.command("nvse-cache")
 def prepare_nvse_cache(
-    votes_dir: Annotated[Path, typer.Option()] = DEFAULT_SPLITS,
-    output: Annotated[Path, typer.Option()] = DEFAULT_NVSE_SCORES,
-    post_texts: Annotated[Path, typer.Option()] = DEFAULT_POST_TEXTS,
-    user_documents: Annotated[Path, typer.Option()] = DEFAULT_USER_DOCUMENTS,
-    models: Annotated[Path, typer.Option()] = DEFAULT_NORMVIO_MODELS,
+    votes_dir: Annotated[Path | None, typer.Option()] = None,
+    output: Annotated[Path | None, typer.Option()] = None,
+    post_texts: Annotated[Path | None, typer.Option("--items", "--post-texts")] = None,
+    models: Annotated[Path | None, typer.Option()] = None,
     bert_model: Annotated[str, typer.Option()] = DEFAULT_NORMVIO_BERT,
-    work_dir: Annotated[Path, typer.Option()] = DEFAULT_NVSE_WORK,
+    work_dir: Annotated[Path | None, typer.Option()] = None,
     device: Annotated[str, typer.Option(help="cpu, cuda, or empty for auto-detect.")] = "",
+    dataset: DatasetOption = "reddit",
     force: Annotated[bool, typer.Option("--force")] = False,
     dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
 ) -> None:
     """Compute the split-independent NormVio post-score cache once."""
+    paths = _layout(dataset)
+    votes_dir = votes_dir or paths.splits
+    output = output or paths.nvse_scores
     if _prepared(output, force) and not dry_run:
         return
     command = _python_module(
@@ -1206,15 +1302,13 @@ def prepare_nvse_cache(
         "--violation_scores",
         output,
         "--post_texts",
-        post_texts,
-        "--docs",
-        user_documents,
+        post_texts or paths.default_inputs().post_texts,
         "--models",
-        models,
+        models or paths.normvio_models,
         "--bert_model",
         bert_model,
         "--out_dir",
-        work_dir,
+        work_dir or paths.nvse_work,
         "--tasks",
         "score",
         "--device",
@@ -1225,8 +1319,52 @@ def prepare_nvse_cache(
     _execute(
         [("nvse-post-scores", command)],
         category="prepare",
-        manifest_path=Path("data/interim/reddit/prepare_nvse_cache_run.json"),
+        manifest_path=paths.run_manifests / "prepare_nvse_cache_run.json",
         splits_root=votes_dir,
+        dry_run=dry_run,
+    )
+
+
+@prepare_app.command("sef-cache")
+def prepare_sef_cache(
+    input_path: Annotated[Path | None, typer.Option("--input")] = None,
+    post_texts: Annotated[Path | None, typer.Option("--items", "--post-texts")] = None,
+    user_documents: Annotated[Path | None, typer.Option()] = None,
+    splits_root: Annotated[
+        list[Path] | None,
+        typer.Option(help="Split collections to materialize profiles for; repeatable."),
+    ] = None,
+    embedding_cache: Annotated[Path | None, typer.Option()] = None,
+    embedding_model: Annotated[str, typer.Option()] = DEFAULT_EMBEDDING_MODEL,
+    posts_only: Annotated[
+        bool, typer.Option(help="Only post embeddings (Team Formation without SEF).")
+    ] = False,
+    dataset: DatasetOption = "reddit",
+    force: Annotated[bool, typer.Option("--force")] = False,
+    dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
+) -> None:
+    """Encode post texts and causal user profiles once for SEF and Team Formation."""
+    paths = _layout(dataset)
+    defaults = paths.default_inputs()
+    roots = splits_root or [
+        paths.splits,
+        *([paths.splits / KFOLD_DIRNAME] if (paths.splits / KFOLD_DIRNAME).exists() else []),
+    ]
+    command = _semantic_cache_command(
+        votes=_votes_or_fail(input_path or defaults.votes, dataset),
+        post_texts=post_texts or defaults.post_texts,
+        user_documents=user_documents or paths.user_documents,
+        embedding_cache=embedding_cache or paths.embedding_cache,
+        embedding_model=embedding_model,
+        splits_roots=roots,
+        posts_only=posts_only,
+        force=force,
+    )
+    _execute(
+        [("semantic-cache", command)],
+        category="prepare",
+        manifest_path=paths.run_manifests / "prepare_sef_cache_run.json",
+        splits_root=paths.splits,
         dry_run=dry_run,
     )
 
@@ -1296,6 +1434,8 @@ def _granular_method_jobs(
 
         if "baselines" in selected:
             for baseline in BASELINE_METHODS:
+                if baseline in excluded_methods:
+                    continue
                 jobs.append(
                     CommandJob(
                         f"{split_name}/baseline/{baseline}",
@@ -1374,9 +1514,7 @@ def _granular_method_jobs(
                 )
                 jobs.append(gpu_job(f"{split_name}/{'-'.join(variants)}", command))
         if "team-formation" in selected:
-            excluded = set(
-                nested_exclusions("team-formation", excluded_methods, NESTED_METHODS)
-            )
+            excluded = set(nested_exclusions("team-formation", excluded_methods, NESTED_METHODS))
             for method in TEAM_FORMATION_METHODS:
                 if method in excluded:
                     continue
@@ -1400,36 +1538,39 @@ def _granular_method_jobs(
                     command.extend(("--team-size", "3"))
                 jobs.append(CommandJob(f"{split_name}/{method}", command, resource="memory"))
 
-    # SEF deliberately remains one shared-cache producer/consumer process.  Its
-    # expensive hyperparameter work is optimized internally; launching one copy
-    # per split would duplicate the base vote table and temporal profile cache.
-    if "sef" in selected:
-        args: list[object] = [
-            "--votes-dir",
-            splits_root,
-            "--output-dir",
-            results_root,
-            "--causal-features",
-            causal_features,
-            "--input-csv",
-            input_path,
-            "--post-texts",
-            post_texts,
-            "--user-documents",
-            user_documents,
-            "--embedding-dir",
-            embedding_cache,
-            "--embedding-model",
-            embedding_model,
-            "--tasks",
-            "splits",
-            "--n-workers",
-            resolve_worker_count(n_workers),
-        ]
-        if reuse_sef_hyperparameters:
-            args.append("--reuse-hyperparams")
-        command = _python_module("src.methods.semantic_expert_finder", *args)
-        jobs.append(gpu_job("sef/all-splits", command))
+        if "sef" in selected:
+            # The prepare stage encoded every text and materialized profiles for
+            # all splits, so each split is an independent CPU process that only
+            # memory-maps the shared read-only caches (no GIL contention).
+            args: list[object] = [
+                "--votes-dir",
+                split_path,
+                "--split-label",
+                split_name,
+                "--output-dir",
+                results_root,
+                "--causal-features",
+                causal_features,
+                "--post-texts",
+                post_texts,
+                "--user-documents",
+                user_documents,
+                "--embedding-dir",
+                embedding_cache,
+                "--embedding-model",
+                embedding_model,
+                "--tasks",
+                "splits",
+                "--prepared-cache",
+            ]
+            if reuse_sef_hyperparameters:
+                args.append("--reuse-hyperparams")
+            jobs.append(
+                CommandJob(
+                    f"{split_name}/sef",
+                    _python_module("src.methods.semantic_expert_finder", *args),
+                )
+            )
 
     resource_limits = {"memory": 1}
     resource_limits.update({f"gpu:{gpu}": 1 for gpu in gpus})
@@ -1454,17 +1595,28 @@ def run_methods(
             help="Method name to omit, such as bandit or sef; repeat for several.",
         ),
     ] = None,
-    splits_root: Annotated[Path, typer.Option()] = DEFAULT_SPLITS,
-    results_root: Annotated[Path, typer.Option()] = DEFAULT_RESULTS,
-    input_path: Annotated[Path, typer.Option("--input")] = DEFAULT_INPUT,
-    causal_features: Annotated[Path, typer.Option()] = DEFAULT_CAUSAL_FEATURES,
-    nvse_scores: Annotated[Path, typer.Option()] = DEFAULT_NVSE_SCORES,
-    nvse_work: Annotated[Path, typer.Option()] = DEFAULT_NVSE_WORK,
-    post_texts: Annotated[Path, typer.Option()] = DEFAULT_POST_TEXTS,
-    user_documents: Annotated[Path, typer.Option()] = DEFAULT_USER_DOCUMENTS,
-    external_scores: Annotated[Path, typer.Option()] = DEFAULT_EXTERNAL_SCORES,
-    embedding_cache: Annotated[Path, typer.Option()] = DEFAULT_EMBEDDING_CACHE,
+    splits_root: Annotated[Path | None, typer.Option()] = None,
+    results_root: Annotated[Path | None, typer.Option()] = None,
+    input_path: Annotated[Path | None, typer.Option("--input")] = None,
+    causal_features: Annotated[Path | None, typer.Option()] = None,
+    nvse_scores: Annotated[Path | None, typer.Option()] = None,
+    nvse_work: Annotated[Path | None, typer.Option()] = None,
+    items: Annotated[
+        Path | None, typer.Option("--items", help="Per-item texts + scores table.")
+    ] = None,
+    post_texts: Annotated[Path | None, typer.Option(help="Legacy override.")] = None,
+    user_documents: Annotated[Path | None, typer.Option()] = None,
+    external_scores: Annotated[Path | None, typer.Option(help="Legacy override.")] = None,
+    embedding_cache: Annotated[Path | None, typer.Option()] = None,
     embedding_model: Annotated[str, typer.Option()] = DEFAULT_EMBEDDING_MODEL,
+    dataset: DatasetOption = "reddit",
+    prepare_cache: Annotated[
+        bool,
+        typer.Option(
+            help="Build/verify the shared SEF/Team Formation embedding cache first "
+            "(a no-op when current).",
+        ),
+    ] = True,
     device: Annotated[
         str,
         typer.Option(help="Device for MA-QSMF: cpu, cuda, or cuda:N."),
@@ -1515,6 +1667,18 @@ def run_methods(
     manifest: Annotated[Path | None, typer.Option()] = None,
 ) -> None:
     """Fit/evaluate selected methods on every discovered canonical split."""
+    paths = _layout(dataset)
+    defaults = paths.default_inputs()
+    splits_root = splits_root or paths.splits
+    results_root = results_root or paths.results
+    input_path = _votes_or_fail(input_path or defaults.votes, dataset)
+    causal_features = causal_features or paths.causal_features
+    nvse_scores = nvse_scores or paths.nvse_scores
+    nvse_work = nvse_work or paths.nvse_work
+    post_texts = post_texts or items or defaults.post_texts
+    external_scores = external_scores or items or defaults.item_scores
+    user_documents = user_documents or paths.user_documents
+    embedding_cache = embedding_cache or paths.embedding_cache
     requested = method or ["all"]
     try:
         selected, normalized_exclusions = resolve_method_selection(
@@ -1554,9 +1718,31 @@ def run_methods(
         n_workers,
     )
     resource_limits["memory"] = memory_workers
-    manifest_path = manifest or Path(
-        "results/reproducibility/"
-        + ("latest_kfold_methods_run.json" if k_fold else "latest_methods_run.json")
+    semantic_methods = {"sef", "team-formation"} & set(selected)
+    if prepare_cache and semantic_methods:
+        cache_job = CommandJob(
+            "prepare-sef-cache",
+            _semantic_cache_command(
+                votes=input_path,
+                post_texts=post_texts,
+                user_documents=user_documents,
+                embedding_cache=embedding_cache,
+                embedding_model=embedding_model,
+                splits_roots=[evaluation_splits_root],
+                posts_only="sef" not in selected,
+            ),
+            resource="accelerator",
+        )
+        # SEF and Team Formation read this cache; everything else starts at once.
+        commands = [cache_job] + [
+            replace(job, after=(*job.after, cache_job.name))
+            if job.name.endswith(("/sef", *(f"/{name}" for name in TEAM_FORMATION_METHODS)))
+            else job
+            for job in commands
+        ]
+        resource_limits.setdefault("accelerator", 1)
+    manifest_path = manifest or results_root.parent / "reproducibility" / (
+        "latest_kfold_methods_run.json" if k_fold else "latest_methods_run.json"
     )
     _execute(
         commands,
@@ -1582,12 +1768,12 @@ def run_methods(
                         "--results-root",
                         evaluation_results_root,
                         "--output-dir",
-                        DEFAULT_REPORT / "kfold",
+                        paths.report / "kfold",
                     ),
                 )
             ],
             category="kfold-graphs",
-            manifest_path=Path("results/reproducibility/latest_kfold_graphs_run.json"),
+            manifest_path=results_root.parent / "reproducibility" / "latest_kfold_graphs_run.json",
             splits_root=evaluation_splits_root,
             dry_run=False,
         )
@@ -1595,18 +1781,19 @@ def run_methods(
 
 @run_app.command("kfold-graphs")
 def run_kfold_graphs(
-    splits_root: Annotated[Path, typer.Option()] = DEFAULT_SPLITS,
-    results_root: Annotated[Path, typer.Option()] = DEFAULT_RESULTS,
+    splits_root: Annotated[Path | None, typer.Option()] = None,
+    results_root: Annotated[Path | None, typer.Option()] = None,
     output_dir: Annotated[Path | None, typer.Option()] = None,
+    dataset: DatasetOption = "reddit",
     dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
-    manifest: Annotated[Path, typer.Option()] = Path(
-        "results/reproducibility/latest_kfold_graphs_run.json"
-    ),
+    manifest: Annotated[Path | None, typer.Option()] = None,
 ) -> None:
     """Generate method-comparison graphs with mean and SD across K-fold runs."""
-    evaluation_splits_root = _scoped_root(splits_root, KFOLD_DIRNAME)
-    evaluation_results_root = _scoped_root(results_root, KFOLD_DIRNAME)
-    destination = output_dir or DEFAULT_REPORT / "kfold"
+    paths = _layout(dataset)
+    evaluation_splits_root = _scoped_root(splits_root or paths.splits, KFOLD_DIRNAME)
+    evaluation_results_root = _scoped_root(results_root or paths.results, KFOLD_DIRNAME)
+    destination = output_dir or paths.report / "kfold"
+    manifest = manifest or paths.results / "reproducibility" / "latest_kfold_graphs_run.json"
     command = _python_module(
         "src.comparison.graphs",
         "--k-fold-only",
@@ -1635,16 +1822,20 @@ def run_graphs(
             help="Repeat to select sections; omit for the complete report.",
         ),
     ] = None,
-    results_root: Annotated[Path, typer.Option()] = DEFAULT_RESULTS,
-    splits_root: Annotated[Path, typer.Option()] = DEFAULT_SPLITS,
-    output_dir: Annotated[Path, typer.Option()] = DEFAULT_REPORT,
+    results_root: Annotated[Path | None, typer.Option()] = None,
+    splits_root: Annotated[Path | None, typer.Option()] = None,
+    output_dir: Annotated[Path | None, typer.Option()] = None,
     strict_audit: Annotated[bool, typer.Option()] = False,
+    dataset: DatasetOption = "reddit",
     dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
-    manifest: Annotated[Path, typer.Option()] = Path(
-        "results/reproducibility/latest_graphs_run.json"
-    ),
+    manifest: Annotated[Path | None, typer.Option()] = None,
 ) -> None:
     """Regenerate graphs/tables from all discovered split and method outputs."""
+    paths = _layout(dataset)
+    results_root = results_root or paths.results
+    splits_root = splits_root or paths.splits
+    output_dir = output_dir or paths.report
+    manifest = manifest or paths.results / "reproducibility" / "latest_graphs_run.json"
     arguments: list[object] = [
         "--results-root",
         results_root,

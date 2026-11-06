@@ -12,15 +12,16 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+from src.layout import REDDIT  # noqa: E402
 from src.methods.team_formation_v2.shared_features import load_split_manifest
 from src.utils.parallel import CommandJob, run_command_jobs
 from src.utils.splits import discover_splits
 
 CHRONOLOGICAL_SPLIT = "intersection_chronological"
-DEFAULT_VOTES_DIR = "data/splits/reddit"
-DEFAULT_OUT_ROOT = "results/reddit"
-DEFAULT_CAUSAL_FEATURES = "data/interim/reddit/features/causal_user_vote_features.parquet"
-DEFAULT_EMBEDDING_DIR = "cache/embeddings"
+DEFAULT_VOTES_DIR = str(REDDIT.splits)
+DEFAULT_OUT_ROOT = str(REDDIT.results)
+DEFAULT_CAUSAL_FEATURES = str(REDDIT.causal_features)
+DEFAULT_EMBEDDING_DIR = str(REDDIT.embedding_cache)
 DEFAULT_TEAM_SIZE = 3
 
 METHODS = {

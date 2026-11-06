@@ -19,6 +19,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+from src.layout import REDDIT  # noqa: E402
 from src.methods.nvse.normvio import (  # noqa: E402
     BERT_TYPE,
     CATEGORIES,
@@ -39,6 +40,7 @@ from src.utils.net_vote_fallback import (  # noqa: E402
     calibrate_net_vote_threshold,
 )
 from src.utils.splits import discover_splits  # noqa: E402
+from src.utils.threshold_search import best_threshold  # noqa: E402
 
 THRESHOLD_GRID = np.linspace(-1.5, 1.5, 300)
 MIN_VOTES_SKILL = 5
@@ -260,14 +262,9 @@ def _compute_nvse_scores(
 def _calibrate(item_scores: pd.DataFrame, val_ids: np.ndarray) -> float:
     """Select a decision threshold on validation scores."""
     val = item_scores[item_scores["item_id"].isin(val_ids)].dropna(subset=["label"])
-    best_f, best_thr = -1.0, 0.0
-    for thr in THRESHOLD_GRID:
-        y_pred = np.where(val["nvse_score"].values >= thr, 1, -1)
-        _, _, f, _ = precision_recall_fscore_support(
-            val["label"].values, y_pred, labels=[1, -1], average="macro", zero_division=0
-        )
-        if f > best_f:
-            best_f, best_thr = f, thr
+    best_thr, _ = best_threshold(
+        val["label"].values, val["nvse_score"].values, THRESHOLD_GRID, default=0.0
+    )
     return best_thr
 
 
@@ -492,19 +489,16 @@ def parse_args() -> argparse.Namespace:
         description="NormVio + Skill Extraction - full pipeline",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--votes_dir", default="data/splits/reddit")
-    p.add_argument(
-        "--docs",
-        default="data/interim/reddit/auxiliary/user_documents.parquet",
-    )
+    p.add_argument("--votes_dir", default=str(REDDIT.splits))
     p.add_argument(
         "--post_texts",
-        default="data/interim/reddit/auxiliary/post_texts.parquet",
-        help="Canonical item_id/title/selftext table used for post scoring.",
+        "--items",
+        default=str(REDDIT.default_inputs().post_texts),
+        help="Per-item table with title/selftext or text, used for post scoring.",
     )
     p.add_argument(
         "--models",
-        default="external/normvio/normvio_redditmodels",
+        default=str(REDDIT.normvio_models),
         help="Dir with one sub-folder per category (finetuned_model.pt)",
     )
     p.add_argument(
@@ -514,12 +508,12 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--out_dir",
-        default="cache/nvse/work",
+        default=str(REDDIT.nvse_work),
         help="Working directory for optional legacy skill/K-fold tasks",
     )
     p.add_argument(
         "--results_dir",
-        default="results/reddit",
+        default=str(REDDIT.results),
         help="Root for canonical per-split outputs (independent of out_dir work artifacts)",
     )
     p.add_argument(
@@ -610,7 +604,6 @@ def main():
             tokenizer = BertTokenizer.from_pretrained(str(bert_source))
             score_violations(
                 Path(args.votes_dir),
-                Path(args.docs),
                 Path(args.models),
                 viol_scores_path,
                 tokenizer,

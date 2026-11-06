@@ -3,77 +3,47 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import functools
 import hashlib
 import json
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import faiss
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
+from src import layout
 from src.utils.splits import discover_splits
-from src.utils.tabular import read_table, unix_seconds
+from src.utils.tabular import unix_seconds
 
 from .runtime import (
     BATCH_SIZE,
     EMBEDDING_DIM,
     EMBEDDING_MODEL,
-    FETCH_DIR,
-    ORIGINAL_CSV,
-    SPLITS_DIR,
-    STEP1_DIR,
     log,
 )
 
 # 1. DATA LOADING
 
 
-def load_votes(input_csv: Optional[Path] = None) -> pd.DataFrame:
-    """Load votes from its configured source."""
-    for csv_path in [p for p in [input_csv, ORIGINAL_CSV] if p is not None]:
-        if csv_path.exists():
-            df = read_table(csv_path)
-            df["vote"] = pd.to_numeric(df["vote"], errors="coerce")
-            df["label"] = pd.to_numeric(df["label"], errors="coerce")
-            df = df[df["vote"].isin([1, -1]) & df["label"].isin([1, -1])].copy()
-            df["vote"] = df["vote"].astype(int)
-            df["label"] = df["label"].astype(int)
-            if "timestamp" in df:
-                df["timestamp"] = unix_seconds(df["timestamp"])
-            df = df.dropna(subset=["item_id", "username", "vote", "label"])
-            df = df.drop_duplicates(subset=["username", "item_id"])
-            log.info(
-                "Votes: %d rows, %d posts, %d users, %d communities",
-                len(df),
-                df["item_id"].nunique(),
-                df["username"].nunique(),
-                df["community"].nunique(),
-            )
-            return df
-
-    log.warning("CSV not found; falling back to Parquet files.")
-    path = STEP1_DIR / "filtered_votes.parquet"
-    if path.exists():
-        df = pd.read_parquet(path)
-    else:
-        dfs = [
-            pd.read_parquet(SPLITS_DIR / "intersection" / f"{s}_votes.parquet")
-            for s in ("train", "val", "test")
-            if (SPLITS_DIR / "intersection" / f"{s}_votes.parquet").exists()
-        ]
-        df = pd.concat(dfs, ignore_index=True)
-    df = df.dropna(subset=["item_id", "username", "vote", "label"])
+def load_votes(input_csv: Path) -> pd.DataFrame:
+    """Load the configured votes table (no implicit fallbacks)."""
+    if input_csv is None:
+        raise ValueError("SEF requires the votes table (--input)")
+    df = layout.load_votes(input_csv)
+    df = df[df["vote"].isin([1, -1]) & df["label"].isin([1, -1])].copy()
     df["vote"] = df["vote"].astype(int)
     df["label"] = df["label"].astype(int)
-    if "timestamp" in df:
-        df["timestamp"] = unix_seconds(df["timestamp"])
+    df = df.dropna(subset=["item_id", "username", "vote", "label"])
+    df = df.drop_duplicates(subset=["username", "item_id"])
     log.info(
-        "Votes: %d rows, %d posts, %d users",
+        "Votes: %d rows, %d posts, %d users, %d communities",
         len(df),
         df["item_id"].nunique(),
         df["username"].nunique(),
+        df["community"].nunique(),
     )
     return df
 
@@ -89,45 +59,22 @@ def _load_split_votes(path: Path) -> pd.DataFrame:
     return df
 
 
-def load_post_texts(path: Path | None = None) -> pd.DataFrame:
-    """Load post texts from its configured source."""
-    path = path or FETCH_DIR / "post_texts.parquet"
-    if not path.exists():
-        raise FileNotFoundError(f"Post texts not found at {path}.")
-    df = read_table(path)
-    if "timestamp" not in df and "created_utc" in df:
-        df = df.rename(columns={"created_utc": "timestamp"})
-    if "item_id" not in df and "thing_id" in df:
-        df = df.rename(columns={"thing_id": "item_id"})
-    missing = {"item_id", "text"} - set(df.columns)
-    if missing:
-        raise ValueError(f"{path} is missing SEF post-text columns: {sorted(missing)}")
+def load_post_texts(path: Path) -> pd.DataFrame:
+    """Load the canonical item table rows that carry text."""
+    df = layout.load_items(path, required=layout.ITEM_TEXT_COLUMNS)
     before = len(df)
     df = df[df["text"].notna()].copy()
     log.info("Post texts available: %d of %d", len(df), before)
     return df
 
 
-def load_user_documents(path: Path | None = None) -> pd.DataFrame:
-    """Load user documents from its configured source."""
-    path = path or FETCH_DIR / "user_documents.parquet"
-    if not path.exists():
+def load_user_documents(path: Path | None) -> pd.DataFrame:
+    """Load user documents; a missing table yields the neutral Signal C."""
+    if path is None or not Path(path).exists():
         log.warning("User documents not found; Signal C will use the neutral value 0.5.")
         return pd.DataFrame(columns=["username", "timestamp", "text"])
-    df = read_table(path)
-    if "timestamp" not in df and "created_utc" in df:
-        df = df.rename(columns={"created_utc": "timestamp"})
-    if "item_id" not in df and "thing_id" in df:
-        df = df.rename(columns={"thing_id": "item_id"})
-    missing = {"username", "text"} - set(df.columns)
-    if missing:
-        raise ValueError(f"{path} is missing SEF user-document columns: {sorted(missing)}")
+    df = layout.load_user_documents(path)
     df = df[df["text"].notna()].copy()
-    if "timestamp" not in df:
-        raise ValueError(
-            f"{path} has no timestamp column; causal SEF user profiles require timestamps"
-        )
-    df["timestamp"] = unix_seconds(df["timestamp"])
     missing_time = int(df["timestamp"].isna().sum())
     if missing_time:
         log.warning("Dropping %d user documents without a valid timestamp", missing_time)
@@ -144,6 +91,18 @@ def _get_model() -> str:
     return EMBEDDING_MODEL
 
 
+@functools.lru_cache(maxsize=2)
+def _load_encoder(model_name: str):
+    """Load each encoder once per process.
+
+    Encoding is checkpointed in 1,000-text chunks; constructing the model per
+    chunk re-read the weights from disk and re-initialized the device every time.
+    """
+    from sentence_transformers import SentenceTransformer
+
+    return SentenceTransformer(model_name)
+
+
 def _encode_texts(
     texts: List[str],
     model_name: str,
@@ -151,10 +110,8 @@ def _encode_texts(
     batch_size: int = BATCH_SIZE,
 ) -> np.ndarray:
     """Encode text batches without relying on an external utility script."""
-    from sentence_transformers import SentenceTransformer
-
     log.info("Encoding %d texts", len(texts))
-    encoder = SentenceTransformer(model_name)
+    encoder = _load_encoder(model_name)
     return encoder.encode(
         texts,
         batch_size=batch_size,
@@ -512,15 +469,7 @@ def build_temporal_user_profiles(
         manifest_path,
     )
     if all(path.exists() for path in artifacts):
-        offsets_payload = json.loads(offsets_path.read_text(encoding="utf-8"))
-        return TemporalUserProfiles(
-            profile_embeddings=np.load(profiles_path, mmap_mode="r"),
-            cutoffs=np.load(cutoffs_path, mmap_mode="r"),
-            document_counts=np.load(counts_path, mmap_mode="r"),
-            latest_document_timestamps=np.load(latest_path, mmap_mode="r"),
-            user_offsets={key: tuple(value) for key, value in offsets_payload.items()},
-            cache_key=cache_key,
-        )
+        return _load_profile_directory(cache_dir, cache_key)
 
     if documents.empty or queries.empty:
         cache_dir.mkdir(parents=True, exist_ok=True)
@@ -642,6 +591,101 @@ def build_temporal_user_profiles(
         latest_document_timestamps=np.load(latest_path, mmap_mode="r"),
         user_offsets=user_offsets,
         cache_key=cache_key,
+    )
+
+
+PROFILE_FILES = (
+    "profile_embeddings.npy",
+    "cutoffs.npy",
+    "document_counts.npy",
+    "latest_document_timestamps.npy",
+    "user_offsets.json",
+    "manifest.json",
+)
+PREPARED_CACHE_MANIFEST = "prepared_cache.json"
+
+
+def _load_profile_directory(cache_dir: Path, cache_key: str) -> TemporalUserProfiles:
+    """Memory-map one materialized temporal-profile cache directory."""
+    offsets_payload = json.loads((cache_dir / "user_offsets.json").read_text(encoding="utf-8"))
+    return TemporalUserProfiles(
+        profile_embeddings=np.load(cache_dir / "profile_embeddings.npy", mmap_mode="r"),
+        cutoffs=np.load(cache_dir / "cutoffs.npy", mmap_mode="r"),
+        document_counts=np.load(cache_dir / "document_counts.npy", mmap_mode="r"),
+        latest_document_timestamps=np.load(
+            cache_dir / "latest_document_timestamps.npy", mmap_mode="r"
+        ),
+        user_offsets={key: tuple(value) for key, value in offsets_payload.items()},
+        cache_key=cache_key,
+    )
+
+
+def write_prepared_cache_manifest(
+    embed_dir: Path,
+    *,
+    profiles: TemporalUserProfiles,
+    n_posts: int,
+    model: str,
+    input_hashes: Dict[str, Optional[str]],
+    splits_roots: List[str],
+) -> Path:
+    """Record which post-embedding/profile cache a prepare run produced.
+
+    Per-split SEF processes and Team Formation read this instead of re-hashing
+    the (potentially large) text tables or recomputing profile requests.
+    Profiles are materialized for the union of all requested splits, and
+    lookups are exact per (user, cutoff), so one cache serves every split.
+    """
+    payload = {
+        "schema_version": 1,
+        "model": model,
+        "n_posts": n_posts,
+        "profile_cache_key": profiles.cache_key,
+        "input_sha256": input_hashes,
+        "splits_roots": splits_roots,
+    }
+    path = embed_dir / PREPARED_CACHE_MANIFEST
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    temporary.replace(path)
+    return path
+
+
+def load_prepared_cache(
+    embed_dir: Path,
+    *,
+    model: str,
+    input_hashes: Dict[str, Optional[str]],
+) -> Tuple[np.ndarray, List[str], TemporalUserProfiles]:
+    """Load the post embeddings and temporal profiles built by ``prepare sef-cache``."""
+    path = embed_dir / PREPARED_CACHE_MANIFEST
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"No prepared SEF cache at {path}; run `python -m src.pipeline prepare sef-cache`"
+        )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    stale = [
+        name
+        for name, digest in input_hashes.items()
+        if payload.get("input_sha256", {}).get(name) != digest
+    ]
+    if payload.get("model") != model or stale:
+        raise ValueError(
+            f"Prepared SEF cache {path} was built from different inputs "
+            f"({', '.join(stale) or 'model'}); rerun `prepare sef-cache --force`"
+        )
+    embeddings = np.load(embed_dir / "post_embeddings.npy", mmap_mode="r")
+    item_ids = json.loads((embed_dir / "post_ids.json").read_text(encoding="utf-8"))
+    if len(embeddings) != len(item_ids) or len(item_ids) != payload.get("n_posts"):
+        raise ValueError(f"Prepared post embeddings under {embed_dir} are incomplete")
+    cache_key = payload["profile_cache_key"]
+    cache_dir = embed_dir / "temporal_user_profiles" / cache_key
+    if not all((cache_dir / name).exists() for name in PROFILE_FILES):
+        raise FileNotFoundError(f"Prepared temporal profile cache is incomplete: {cache_dir}")
+    return (
+        np.asarray(embeddings, dtype=np.float32),
+        item_ids,
+        _load_profile_directory(cache_dir, cache_key),
     )
 
 
